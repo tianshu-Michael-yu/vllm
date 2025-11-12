@@ -75,6 +75,46 @@ if (CUDA_FOUND AND NOT NVCC_EXECUTABLE)
     message(FATAL_ERROR "nvcc not found")
 endif()
 
+######## CUDA13.0 INTEGRATION #######
+
+if (DEFINED ENV{CONDA_PREFIX} AND NOT DEFINED CUDAToolkit_ROOT)
+  set(CUDAToolkit_ROOT "$ENV{CONDA_PREFIX}/targets/x86_64-linux" CACHE PATH "" FORCE)
+endif()
+set(CUDA_TOOLKIT_ROOT_DIR "${CUDAToolkit_ROOT}" CACHE PATH "" FORCE)
+list(PREPEND CMAKE_PREFIX_PATH "${CUDAToolkit_ROOT}")
+
+# Find CUDA first (so TorchConfig sees a working toolkit)
+find_package(CUDAToolkit REQUIRED)
+
+# CUDA 12.9+/13: nvToolsExt is replaced by nvtx3; create a compat target.
+if (NOT TARGET CUDA::nvToolsExt)
+  if (TARGET CUDA::nvtx3)
+    add_library(CUDA::nvToolsExt INTERFACE IMPORTED)
+    target_link_libraries(CUDA::nvToolsExt INTERFACE CUDA::nvtx3)
+    target_compile_definitions(CUDA::nvToolsExt INTERFACE TORCH_CUDA_USE_NVTX3)
+  else()
+    # Fallback: locate nvtx3 headers/libs manually in conda CUDA
+    find_path(NVTX3_INCLUDE_DIR NAMES nvtx3/nvtx3.hpp
+              PATHS "${CUDAToolkit_ROOT}/include")
+    find_library(NVTX3_LIBRARY NAMES nvtx3 nvToolsExt
+                 PATHS "${CUDAToolkit_ROOT}/lib" "${CUDAToolkit_ROOT}/lib64")
+    if (NVTX3_INCLUDE_DIR AND NVTX3_LIBRARY)
+      add_library(CUDA::nvToolsExt INTERFACE IMPORTED)
+      target_include_directories(CUDA::nvToolsExt INTERFACE "${NVTX3_INCLUDE_DIR}")
+      target_link_libraries(CUDA::nvToolsExt INTERFACE "${NVTX3_LIBRARY}")
+      target_compile_definitions(CUDA::nvToolsExt INTERFACE TORCH_CUDA_USE_NVTX3)
+    endif()
+  endif()
+endif()
+
+# Make sure regular C++ compilation sees CUDA headers (conda layout)
+include_directories(SYSTEM "${CUDAToolkit_ROOT}/include")
+if (EXISTS "${CUDAToolkit_ROOT}/include/cccl")
+  include_directories(SYSTEM "${CUDAToolkit_ROOT}/include/cccl")
+endif()
+
+######## CUDA13.0 INTEGRATION #######
+
 #
 # Import torch cmake configuration.
 # Torch also imports CUDA (and partially HIP) languages with some customizations,
