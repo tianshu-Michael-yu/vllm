@@ -291,5 +291,8 @@ def supports_pdl(device: torch.device | None = None) -> bool:
     """
     Refer to: https://github.com/triton-lang/triton/blob/v3.5.0/python/tutorials/11-programmatic-dependent-launch.py
     """
+    # NOTE(pp): Currently does not work on SM100 Blackwells, so we bypass here.
+    if current_platform.is_cuda() and current_platform.has_device_capability(100):
+        return False
     # PDL requires compute capability SM90 or above
     return current_platform.is_cuda() and current_platform.has_device_capability(90)
