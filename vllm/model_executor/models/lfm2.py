@@ -267,7 +267,7 @@ class Lfm2ShortConvDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.short_conv = ShortConv(
             config=config,
-            dim=config.conv_dim,
+            dim=config.hidden_size,
             layer_idx=layer_idx,
             model_config=model_config,
             cache_config=cache_config,

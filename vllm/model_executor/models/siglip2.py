@@ -4,32 +4,23 @@
 within a vision language model."""
 
 from collections.abc import Iterable
-from typing import Optional
 
 import torch
-from einops import rearrange, repeat
 from torch import nn
 from torch.nn import functional as F
 from transformers import Siglip2VisionConfig
-from transformers.configuration_utils import PretrainedConfig
 
 from vllm.attention.layer import MultiHeadAttention
-from vllm.attention.backends.registry import AttentionBackendEnum
-from vllm.attention.layer import maybe_get_vit_flash_attn_backend
-from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
-    LinearBase,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.platforms import current_platform
 
-from .vision import get_vit_attn_backend
 from .vision import run_dp_sharded_vision_model
 
 
@@ -60,9 +51,11 @@ class Siglip2VisionEmbeddings(nn.Module):
             positional_embeddings (`torch.Tensor`):
                 Position embeddings of shape (height, width, embed_dim)
             spatial_shapes (`torch.LongTensor`):
-                Spatial shapes of shape (batch_size, 2) to resize the positional embeddings to
+                Spatial shapes of shape (batch_size, 2) to resize the positional
+                embeddings to
             max_length (`int`):
-                Maximum length of the positional embeddings to pad resized positional embeddings to
+                Maximum length of the positional embeddings to pad resized
+                positional embeddings to
 
         Returns:
             `torch.Tensor`: Embeddings of shape (batch_size, max_length, embed_dim)
@@ -80,7 +73,8 @@ class Siglip2VisionEmbeddings(nn.Module):
         # (height, width, embed_dim) -> (1, embed_dim, height, width) for interpolation
         positional_embeddings = positional_embeddings.permute(2, 0, 1).unsqueeze(0)
 
-        # Upcast to float32 on CPU because antialias is not supported for bfloat16/float16 on CPU
+        # Upcast to float32 on CPU because antialias is not supported for
+        # bfloat16/float16 on CPU
         if positional_embeddings.device.type == "cpu":
             positional_embeddings = positional_embeddings.to(torch.float32)
 
@@ -95,8 +89,11 @@ class Siglip2VisionEmbeddings(nn.Module):
                 antialias=True,
             )
 
-            # (1, dim, target_height, target_width) -> (target_height * target_width, dim)
-            resized_embeddings = resized_embeddings.reshape(embed_dim, height * width).transpose(0, 1)
+            # (1, dim, target_height, target_width) ->
+            # (target_height * target_width, dim)
+            resized_embeddings = resized_embeddings.reshape(
+                embed_dim, height * width
+            ).transpose(0, 1)
 
             # Cast to original dtype
             resized_embeddings = resized_embeddings.to(source_dtype)
@@ -106,13 +103,17 @@ class Siglip2VisionEmbeddings(nn.Module):
 
         return resulted_positional_embeddings
 
-    def forward(self, pixel_values: torch.FloatTensor, spatial_shapes: torch.LongTensor) -> torch.Tensor:
+    def forward(
+        self, pixel_values: torch.FloatTensor, spatial_shapes: torch.LongTensor
+    ) -> torch.Tensor:
         """
         Args:
             pixel_values (`torch.FloatTensor`):
-                Pixel values of shape (batch_size, max_num_patches, num_channels * patch_size * patch_size)
+                Pixel values of shape (batch_size, max_num_patches,
+                num_channels * patch_size * patch_size)
             spatial_shapes (`list[tuple[int, int]]`):
-                Spatial shapes of shape (batch_size, 2) to resize the positional embeddings to
+                Spatial shapes of shape (batch_size, 2) to resize the positional
+                embeddings to
         """
 
         # Apply patch embeddings to already patchified pixel values

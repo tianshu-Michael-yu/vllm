@@ -527,14 +527,13 @@ class Lfm2VLForConditionalGeneration(
 
         return MambaStateShapeCalculator.short_conv_state_shape(
             tp_world_size=parallel_config.tensor_parallel_size,
-            intermediate_size=hf_language_config.conv_dim,
+            intermediate_size=hf_language_config.hidden_size,
             conv_kernel=hf_language_config.conv_L_cache,
         )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         super().__init__()
         config: Lfm2VlConfig = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
         vision_config = config.vision_config
 
@@ -549,11 +548,12 @@ class Lfm2VLForConditionalGeneration(
 
             # self.vision_tower = Siglip2Model(
             #     config=vision_config,
-            #     quant_config=quant_config,
+            #     quant_config=_quant_config,
             #     prefix=f"{prefix}.vit",
             #     use_data_parallel=self.use_data_parallel,
             # )
             from transformers import AutoModel
+
             self.vision_tower = AutoModel.from_config(config.vision_config)
         else:
             raise ValueError(
