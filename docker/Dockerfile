@@ -377,6 +377,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
         software-properties-common \
         curl \
         sudo \
+        git \
         python3-pip \
         ffmpeg \
         libsm6 \
