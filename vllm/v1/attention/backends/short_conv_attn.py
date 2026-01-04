@@ -40,6 +40,8 @@ class ShortConvAttentionMetadata:
 class ShortConvAttentionMetadataBuilder(
     BaseMambaAttentionMetadataBuilder[ShortConvAttentionMetadata]
 ):
+    SUPPORTS_CAUSAL_CONV1D_BUFFERS = True
+
     def build(
         self,
         common_prefix_len: int,
@@ -61,21 +63,31 @@ class ShortConvAttentionMetadataBuilder(
 
         has_initial_states_p = None
         if num_prefills > 0:
-            has_initial_states_cpu = (
-                common_attn_metadata.num_computed_tokens_cpu[
-                    num_reqs - num_prefills : num_reqs
-                ]
-                > 0
+            # Compute query_seq_lens from GPU tensor
+            query_seq_lens = (
+                common_attn_metadata.query_start_loc[1:]
+                - common_attn_metadata.query_start_loc[:-1]
             )
-            has_initial_states_p = has_initial_states_cpu.to(query_start_loc.device)
+            # Compute num_computed_tokens on GPU
+            num_computed_tokens = common_attn_metadata.seq_lens - query_seq_lens
+            # Slice the prefill portion and check if > 0
+
+            has_initial_states_p = (
+                num_computed_tokens[num_reqs - num_prefills : num_reqs] > 0
+            )
 
             query_start_loc_p = (
-                common_attn_metadata.query_start_loc[-num_prefills - 1 :]
+                common_attn_metadata.query_start_loc_cpu[-num_prefills - 1 :]
                 - num_decode_tokens
             )
 
+            assert self.causal_conv1d_buffers is not None
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(query_start_loc_p)
+                compute_causal_conv1d_metadata(
+                    query_start_loc_p,
+                    query_start_loc.device,
+                    self.causal_conv1d_buffers,
+                )
             )
 
         elif (

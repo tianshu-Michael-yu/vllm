@@ -18,6 +18,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.attention.backends.utils import CausalConv1dMetadataBuffers
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import (
@@ -138,7 +139,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             device=self.device,
             pin_memory=self.pin_memory,
         )
-        self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+        self.causal_conv1d_buffers = CausalConv1dMetadataBuffers(
+            max_num_tokens=self.max_num_tokens,
+            max_num_reqs=self.max_num_reqs,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+        self.sampler = Sampler(
+            logprobs_mode=self.model_config.logprobs_mode,
+        )
 
         # CUDA graphs.
         self.cudagraph_manager = CudaGraphManager(self.vllm_config, self.device)
@@ -200,6 +209,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.kv_cache_config,
             self.vllm_config,
             self.device,
+            causal_conv1d_buffers=self.causal_conv1d_buffers,
         )
         if self.do_spec_decode:
             # HACK(woosuk)

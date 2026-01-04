@@ -7,7 +7,7 @@ requests >= 2.26.0
 tqdm
 blake3
 py-cpuinfo
-transformers @ git+https://github.com/huggingface/transformers.git@87be5595081364ef99393feeaa60d71db3652679 # TODO: update this after 5.0.0 is released. Required for lfm2_moe
+transformers @ git+https://github.com/huggingface/transformers.git@1e3c5862de0bf3c73ea3fd237af525d4fd294217 # TODO: update this after 5.0.0 is released. Required for lfm2_moe
 tokenizers >= 0.21.1  # Required for fast incremental detokenization.
 protobuf # Required by LlamaTokenizer.
 fastapi[standard] >= 0.115.0 # Required by FastAPI's form models in the OpenAI API server's audio transcriptions endpoint.

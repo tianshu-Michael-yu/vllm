@@ -20,6 +20,7 @@ from transformers.models.lfm2_vl.image_processing_lfm2_vl_fast import (
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
@@ -67,7 +68,6 @@ class Lfm2VLImagePixelInputs(TensorSchema):
 
     type: Literal["pixel_values"] = "pixel_values"
     pixel_values: Annotated[torch.Tensor, TensorShape("bn", "d", "fd")]
-    pixel_attention_mask: Annotated[torch.Tensor, TensorShape("bn", "d")]
     spatial_shapes: Annotated[torch.Tensor, TensorShape("bn", 2)]
     num_patches: torch.Tensor
 
@@ -384,11 +384,10 @@ class Lfm2VLMultiModalProcessor(BaseMultiModalProcessor[Lfm2VLProcessingInfo]):
 
         return dict[str, MultiModalFieldConfig](
             pixel_values=MultiModalFieldConfig.flat_from_sizes("image", num_patches),
-            pixel_attention_mask=MultiModalFieldConfig.flat_from_sizes(
-                "image", num_patches
+            spatial_shapes=MultiModalFieldConfig.flat_from_sizes(
+                "image", num_patches, keep_on_cpu=True
             ),
-            spatial_shapes=MultiModalFieldConfig.flat_from_sizes("image", num_patches),
-            num_patches=MultiModalFieldConfig.batched("image"),
+            num_patches=MultiModalFieldConfig.batched("image", keep_on_cpu=True),
         )
 
     def _get_prompt_updates(
@@ -435,7 +434,9 @@ class Lfm2VLMultiModalProjector(nn.Module):
 
         in_channels = config.vision_config.hidden_size * (config.downsample_factor**2)
         self.factor = config.downsample_factor
-        self.layer_norm = nn.LayerNorm(in_channels)
+        self.projector_use_layernorm = config.projector_use_layernorm
+        if self.projector_use_layernorm:
+            self.layer_norm = nn.LayerNorm(in_channels)
         self.linear_1 = nn.Linear(
             in_channels,
             config.projector_hidden_size,
@@ -450,7 +451,8 @@ class Lfm2VLMultiModalProjector(nn.Module):
 
     def forward(self, image_features: torch.Tensor):
         image_features = self.pixel_unshuffle(image_features)
-        image_features = self.layer_norm(image_features)
+        if self.projector_use_layernorm:
+            image_features = self.layer_norm(image_features)
         hidden_states = self.linear_1(image_features)
         hidden_states = self.act(hidden_states)
         hidden_states = self.linear_2(hidden_states)
@@ -536,25 +538,21 @@ class Lfm2VLForConditionalGeneration(
         config: Lfm2VlConfig = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
         vision_config = config.vision_config
+        quant_config = vllm_config.quant_config
 
         self.config = config
+        self.vllm_config = vllm_config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
 
         if vision_config.model_type == "siglip2_vision_model":
-            # TODO: After MultiHeadAttention class support mask, remove the HF
-            # siglip2.
-            # from vllm.model_executor.models.siglip2 import Siglip2Model
+            from vllm.model_executor.models.siglip2 import Siglip2Model
 
-            # self.vision_tower = Siglip2Model(
-            #     config=vision_config,
-            #     quant_config=_quant_config,
-            #     prefix=f"{prefix}.vit",
-            #     use_data_parallel=self.use_data_parallel,
-            # )
-            from transformers import AutoModel
-
-            self.vision_tower = AutoModel.from_config(config.vision_config)
+            self.vision_tower = Siglip2Model(
+                config=vision_config,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "vision_tower"),
+            )
         else:
             raise ValueError(
                 f"Unsupported visual tokenizer model_type: {vision_config.model_type}"
@@ -584,7 +582,6 @@ class Lfm2VLForConditionalGeneration(
         self, **kwargs: object
     ) -> LFM2VLImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
-        pixel_attention_mask = kwargs.pop("pixel_attention_mask", None)
         spatial_shapes = kwargs.pop("spatial_shapes", None)
         num_patches = kwargs.pop("num_patches", None)
         if pixel_values is None:
@@ -593,7 +590,6 @@ class Lfm2VLForConditionalGeneration(
         return LFM2VLImageInputs(
             type="pixel_values",
             pixel_values=pixel_values,
-            pixel_attention_mask=pixel_attention_mask,
             spatial_shapes=spatial_shapes,
             num_patches=num_patches,
         )
@@ -602,28 +598,52 @@ class Lfm2VLForConditionalGeneration(
         self,
         pixel_values: torch.FloatTensor,
         spatial_shapes: torch.Tensor,
-        pixel_attention_mask: torch.Tensor,
-        num_patches: torch.Tensor,
     ) -> torch.Tensor:
         pixel_values = pixel_values.to(
             dtype=self.vision_tower.vision_model.embeddings.patch_embedding.weight.dtype
         )  # fp16 compatibility
+        if spatial_shapes.is_cuda:
+            spatial_shapes = spatial_shapes.cpu()
 
-        image_outputs = self.vision_tower(
-            pixel_values=pixel_values,
-            pixel_attention_mask=pixel_attention_mask,
-            spatial_shapes=spatial_shapes,
-        ).last_hidden_state
+        # LFM2-VL's HF processor pads patch sequences with trailing zeros.
+        # Derive the valid-patch mask from spatial_shapes instead of carrying
+        # pixel_attention_mask through the vLLM multimodal pipeline.
+        max_seq_len = pixel_values.shape[1]
+        lengths_cpu = (spatial_shapes[:, 0] * spatial_shapes[:, 1]).to(
+            dtype=torch.int32
+        )
+        max_seqlen = int(lengths_cpu.max()) if lengths_cpu.numel() else 0
+        lengths = lengths_cpu.to(device=pixel_values.device)
+        packed_mask = (
+            torch.arange(max_seq_len, device=pixel_values.device)[None, :]
+            < lengths[:, None]
+        )
+        cu_seqlens = torch.zeros(
+            lengths.shape[0] + 1,
+            dtype=torch.int32,
+            device=lengths.device,
+        )
+        cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
 
-        img_feature_lengths = pixel_attention_mask.sum(dim=1)
+        with set_forward_context(None, self.vllm_config):
+            vision_outputs = self.vision_tower(
+                pixel_values=pixel_values,
+                spatial_shapes=spatial_shapes,
+                packed_mask=packed_mask,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+        image_outputs = getattr(vision_outputs, "last_hidden_state", vision_outputs)
 
         image_features = []
 
-        for img_idx, feature_len in enumerate(img_feature_lengths.tolist()):
+        # spatial_shapes is on CPU (keep_on_cpu=True), so .tolist() is instant
+        spatial_shapes_list = spatial_shapes.tolist()
+        for img_idx, (feature_org_h, feature_org_w) in enumerate(spatial_shapes_list):
+            feature_len = feature_org_h * feature_org_w
             feature = image_outputs[img_idx, :feature_len]
 
             # reshape to original height and width
-            feature_org_h, feature_org_w = spatial_shapes[img_idx].tolist()
             feature = feature.reshape(1, feature_org_h, feature_org_w, -1)
 
             # project the image representation
@@ -640,42 +660,25 @@ class Lfm2VLForConditionalGeneration(
         image_input: LFM2VLImageInputs,
     ) -> torch.Tensor | list[torch.Tensor]:
         pixel_values = image_input["pixel_values"]
-        pixel_attention_mask = image_input["pixel_attention_mask"]
         spatial_shapes = image_input["spatial_shapes"]
         num_patches = image_input["num_patches"]
 
         image_features = self.image_pixels_to_features(
             pixel_values,
             spatial_shapes=spatial_shapes,
-            pixel_attention_mask=pixel_attention_mask,
-            num_patches=num_patches,
         )
 
-        # total num patches with token length per patch
-        patch_token_lengths = torch.as_tensor(
-            [f.size(0) for f in image_features],
-            device=image_features[0].device,
-            dtype=torch.long,
-        )
-        image_features = torch.cat(image_features, dim=0)
-
-        # cumulative token boundaries per patch: [0, L0, L0+L1, ..., sum_i Li]
-        token_cum = torch.cat(
-            (
-                torch.zeros(1, device=image_features.device, dtype=torch.long),
-                patch_token_lengths.cumsum(0),
-            ),
-            dim=0,
-        )
-
+        # Group patches by image - num_patches is on CPU (keep_on_cpu=True)
+        # so .tolist() is instant with no DtoH sync
+        num_patches_list = num_patches.tolist()
         batched_features: list[torch.Tensor] = []
-        patch_start_idx = 0
-        for count in num_patches.tolist():
-            patch_end_idx = patch_start_idx + count
-            token_start = token_cum[patch_start_idx].item()
-            token_end = token_cum[patch_end_idx].item()
-            batched_features.append(image_features[token_start:token_end])
-            patch_start_idx = patch_end_idx
+        patch_idx = 0
+        for count in num_patches_list:
+            # Slice the list of patch tensors for this image
+            image_patches = image_features[patch_idx : patch_idx + count]
+            # Concatenate patches for this image
+            batched_features.append(torch.cat(image_patches, dim=0))
+            patch_idx += count
 
         return batched_features
 

@@ -7,6 +7,7 @@ import torch
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
+from vllm.utils.pinned_memory_pool import FixedPinnedRingBuffer
 from vllm.v1.utils import CpuGpuBuffer
 
 
@@ -76,6 +77,14 @@ class BlockTables:
         self.cu_num_new_blocks = self._make_buffer(
             self.num_kv_cache_groups, self.max_num_reqs + 1, dtype=torch.int32
         )
+        max_new_blocks = cdiv(self.max_num_batched_tokens, min(self.block_sizes))
+        self._new_block_ids_buffer = FixedPinnedRingBuffer(
+            (self.num_kv_cache_groups, max_new_blocks),
+            dtype=torch.int32,
+            device=self.device,
+            slots=2,
+            pin_memory=self.pin_memory,
+        )
 
     def _make_buffer(self, *args, dtype: torch.dtype) -> CpuGpuBuffer:
         return CpuGpuBuffer(
@@ -113,17 +122,17 @@ class BlockTables:
         # no clear upper bound to the number of new blocks in a single step.
         # NOTE(woosuk): The buffer has to be cached, because otherwise we cannot
         # guarantee that the buffer is not freed before the copy is completed.
-        self.new_block_ids_cpu = torch.empty(
-            self.num_kv_cache_groups,
-            max(len(x) for x in new_block_ids),
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=self.pin_memory,
+        max_new_blocks = max(len(x) for x in new_block_ids)
+        idx, new_block_ids_cpu = self._new_block_ids_buffer.acquire(
+            (self.num_kv_cache_groups, max_new_blocks)
         )
-        new_block_ids_np = self.new_block_ids_cpu.numpy()
+        new_block_ids_np = new_block_ids_cpu.numpy()
         for i in range(self.num_kv_cache_groups):
             new_block_ids_np[i, : len(new_block_ids[i])] = new_block_ids[i]
-        new_block_ids_gpu = self.new_block_ids_cpu.to(self.device, non_blocking=True)
+        new_block_ids_gpu = new_block_ids_cpu.to(
+            self.device, non_blocking=self.pin_memory
+        )
+        self._new_block_ids_buffer.record(idx)
 
         _append_block_ids_kernel[(self.num_kv_cache_groups, num_reqs)](
             self.req_indices.copy_to_gpu(num_reqs),

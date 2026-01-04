@@ -344,6 +344,9 @@ class MsgpackSerde(ObjectSerde):
         self.encoder = MsgpackEncoder()
         self.tensor_decoder = MsgpackDecoder(torch.Tensor, share_mem=False)
         self.mm_decoder = MsgpackDecoder(MultiModalKwargsItem, share_mem=False)
+        # Avoid per-request cudaHostAlloc churn when decoding cached tensors.
+        self.tensor_decoder.pin_tensors = False
+        self.mm_decoder.pin_tensors = False
         self._mm_kwargs_item_cls = MultiModalKwargsItem
 
     def serialize(self, value: Any) -> tuple[bytes | list[bytes], int, bytes, int]:

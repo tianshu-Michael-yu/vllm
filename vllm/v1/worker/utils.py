@@ -151,18 +151,27 @@ class AttentionGroup:
         device,
         kernel_block_size: int | None,
         num_metadata_builders: int = 1,
+        causal_conv1d_buffers=None,
     ):
         kv_cache_spec_builder = (
             self.kv_cache_spec.copy_with_new_block_size(kernel_block_size)
             if kernel_block_size is not None
             else self.kv_cache_spec
         )
+        builder_cls = self.backend.get_builder_cls()
+        builder_kwargs = {}
+        if causal_conv1d_buffers is not None and getattr(
+            builder_cls, "SUPPORTS_CAUSAL_CONV1D_BUFFERS", False
+        ):
+            builder_kwargs["causal_conv1d_buffers"] = causal_conv1d_buffers
+
         self.metadata_builders = [
-            self.backend.get_builder_cls()(
+            builder_cls(
                 kv_cache_spec_builder,
                 self.layer_names,
                 vllm_config,
                 device,
+                **builder_kwargs,
             )
             for _ in range(num_metadata_builders)
         ]

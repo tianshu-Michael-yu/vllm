@@ -186,7 +186,7 @@ class MMEncoderAttention(CustomOp):
         key: torch.Tensor,
         value: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
-        max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
+        max_seqlen: int | torch.Tensor | None = None,  # Only used for Flash Attention
     ) -> torch.Tensor:
         assert self.flash_attn_varlen_func is not None, (
             "Flash attention function is not set."
@@ -195,6 +195,7 @@ class MMEncoderAttention(CustomOp):
         assert cu_seqlens is not None and max_seqlen is not None
 
         bsz = query.shape[0]
+        max_seqlen = int(max_seqlen)
 
         output = vit_flash_attn_wrapper(
             q=query,
@@ -203,7 +204,6 @@ class MMEncoderAttention(CustomOp):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             batch_size=bsz,
-            is_rocm_aiter=(self.attn_backend == AttentionBackendEnum.ROCM_AITER_FA),
         )
         return output
 
@@ -213,7 +213,7 @@ class MMEncoderAttention(CustomOp):
         key: torch.Tensor,
         value: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
-        max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
+        max_seqlen: int | torch.Tensor | None = None,  # Only used for Flash Attention
     ) -> torch.Tensor:
         return self._forward_sdpa(query, key, value, cu_seqlens)
 
@@ -223,7 +223,7 @@ class MMEncoderAttention(CustomOp):
         key: torch.Tensor,
         value: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
-        max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
+        max_seqlen: int | torch.Tensor | None = None,  # Only used for Flash Attention
     ) -> torch.Tensor:
         if self.is_flash_attn_backend:
             return self._forward_fa(query, key, value, cu_seqlens, max_seqlen)
@@ -241,7 +241,7 @@ class MMEncoderAttention(CustomOp):
         key: torch.Tensor,
         value: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
-        max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
+        max_seqlen: int | torch.Tensor | None = None,  # Only used for Flash Attention
     ) -> torch.Tensor:
         return self._forward_sdpa(query, key, value, cu_seqlens)
 
@@ -251,7 +251,7 @@ class MMEncoderAttention(CustomOp):
         key: torch.Tensor,
         value: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
-        max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
+        max_seqlen: int | torch.Tensor | None = None,  # Only used for Flash Attention
     ) -> torch.Tensor:
         assert self.is_flash_attn_backend, (
             "XPU only supports FLASH_ATTN for vision attention."
@@ -264,7 +264,7 @@ class MMEncoderAttention(CustomOp):
         key: torch.Tensor,
         value: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
-        max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
+        max_seqlen: int | torch.Tensor | None = None,  # Only used for Flash Attention
     ) -> torch.Tensor:
         assert self.attn_backend == AttentionBackendEnum.PALLAS, (
             f"MMEncoderAttention on TPU only supports PALLAS backend, "
@@ -282,3 +282,4 @@ class MMEncoderAttention(CustomOp):
             "Falling back to SDPA implementation.",
         )
         return self._forward_sdpa(query, key, value, cu_seqlens)
+        max_seqlen = int(max_seqlen)

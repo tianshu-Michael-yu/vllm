@@ -27,12 +27,12 @@ def flash_attn_maxseqlen_wrapper(
     cu_seqlens: torch.Tensor,
     max_seqlen: torch.Tensor,
     batch_size: int,
-    is_rocm_aiter: bool,
 ) -> torch.Tensor:
-    if is_rocm_aiter:
-        from aiter import flash_attn_varlen_func
-    else:
-        from vllm.attention.utils.fa_utils import flash_attn_varlen_func
+    from vllm.attention.utils.fa_utils import (
+        flash_attn_varlen_func,
+        get_flash_attn_version,
+    )
+
     q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
     output = flash_attn_varlen_func(
         q,
@@ -44,6 +44,7 @@ def flash_attn_maxseqlen_wrapper(
         max_seqlen_k=max_seqlen.item(),
         dropout_p=0.0,
         causal=False,
+        fa_version=get_flash_attn_version() or 2,
     )
     context_layer = einops.rearrange(output, "(b s) h d -> b s h d", b=batch_size)
     return context_layer
@@ -56,7 +57,6 @@ def flash_attn_maxseqlen_wrapper_fake(
     cu_seqlens: torch.Tensor,
     max_seqlen: torch.Tensor,
     batch_size: int,
-    is_rocm_aiter: bool,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -68,17 +68,64 @@ direct_register_custom_op(
 )
 
 
+def flash_attn_maxseqlen_int_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    batch_size: int,
+) -> torch.Tensor:
+    from vllm.attention.utils.fa_utils import (
+        flash_attn_varlen_func,
+        get_flash_attn_version,
+    )
+
+    q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+    output = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        dropout_p=0.0,
+        causal=False,
+        fa_version=get_flash_attn_version() or 2,
+    )
+    context_layer = einops.rearrange(output, "(b s) h d -> b s h d", b=batch_size)
+    return context_layer
+
+
+def flash_attn_maxseqlen_int_wrapper_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    batch_size: int,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+direct_register_custom_op(
+    op_name="flash_attn_maxseqlen_int_wrapper",
+    op_func=flash_attn_maxseqlen_int_wrapper,
+    fake_impl=flash_attn_maxseqlen_int_wrapper_fake,
+)
+
+
 def vit_flash_attn_wrapper(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    max_seqlen: torch.Tensor,
+    max_seqlen: int,
     batch_size: int,
-    is_rocm_aiter: bool,
 ) -> torch.Tensor:
-    return torch.ops.vllm.flash_attn_maxseqlen_wrapper(
-        q, k, v, cu_seqlens, max_seqlen, batch_size, is_rocm_aiter
+    return torch.ops.vllm.flash_attn_maxseqlen_int_wrapper(
+        q, k, v, cu_seqlens, max_seqlen, batch_size
     )
 
 

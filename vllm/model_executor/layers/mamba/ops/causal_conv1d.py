@@ -540,7 +540,8 @@ def causal_conv1d_fn(
     args = None
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
-    x = x.to(conv_states.dtype)
+    target_dtype = conv_states.dtype if conv_states is not None else x.dtype
+    x = x.to(target_dtype)
     out = torch.empty_like(x)
     if metadata is not None:
         nums_dict = metadata.nums_dict

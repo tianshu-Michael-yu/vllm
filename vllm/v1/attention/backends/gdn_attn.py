@@ -12,6 +12,7 @@ from vllm.config import VllmConfig
 from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
+    CausalConv1dMetadataBuffers,
     CommonAttentionMetadata,
     compute_causal_conv1d_metadata,
     split_decodes_and_prefills,
@@ -62,6 +63,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     reorder_batch_threshold: int = 1
+    SUPPORTS_CAUSAL_CONV1D_BUFFERS = True
 
     def __init__(
         self,
@@ -69,6 +71,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         layer_names: list[str],
         vllm_config: VllmConfig,
         device: torch.device,
+        causal_conv1d_buffers: CausalConv1dMetadataBuffers | None = None,
     ):
         assert isinstance(kv_cache_spec, MambaSpec)
         self.vllm_config = vllm_config
@@ -89,6 +92,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.vllm_config.scheduler_config.max_num_seqs * (self.num_spec + 1),
             self.compilation_config.max_cudagraph_capture_size,
         )
+        self.causal_conv1d_buffers = causal_conv1d_buffers
 
         self.spec_state_indices_tensor = torch.empty(
             (self.decode_cudagraph_max_bs, self.num_spec + 1),
@@ -249,8 +253,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             has_initial_state = context_lens_tensor > 0
             if spec_sequence_masks is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks]
+            non_spec_query_start_loc_cpu = non_spec_query_start_loc.cpu()
+            assert self.causal_conv1d_buffers is not None
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(non_spec_query_start_loc)
+                compute_causal_conv1d_metadata(
+                    non_spec_query_start_loc_cpu,
+                    query_start_loc.device,
+                    self.causal_conv1d_buffers,
+                )
             )
         else:
             has_initial_state = None

@@ -11,7 +11,13 @@ import torch
 from pydantic import ConfigDict, Field, field_validator, model_validator
 from pydantic.dataclasses import dataclass
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
-from transformers.configuration_utils import ALLOWED_LAYER_TYPES
+
+try:
+    from transformers.configuration_utils import ALLOWED_MLP_LAYER_TYPES
+except ImportError:  # transformers < 4.50
+    from transformers.configuration_utils import (
+        ALLOWED_LAYER_TYPES as ALLOWED_MLP_LAYER_TYPES,
+    )
 
 import vllm.envs as envs
 from vllm.attention.backends.registry import AttentionBackendEnum
@@ -2115,7 +2121,7 @@ def _get_and_verify_max_len(
     # To simplify the verification, we convert it to dict[str, TypedDict].
     rope_parameters = getattr(hf_config, "rope_parameters", None)
     if rope_parameters and not set(rope_parameters.keys()).issubset(
-        ALLOWED_LAYER_TYPES
+        ALLOWED_MLP_LAYER_TYPES
     ):
         rope_parameters = {"": rope_parameters}
 

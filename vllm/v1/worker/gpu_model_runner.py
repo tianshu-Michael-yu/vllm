@@ -93,6 +93,7 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
+from vllm.utils.pinned_memory_pool import PinnedTensorPool
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import (
     get_dtype_size,
@@ -103,6 +104,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
+    CausalConv1dMetadataBuffers,
     CommonAttentionMetadata,
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
@@ -178,6 +180,90 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+class _PinnedIndexBuffer:
+    def __init__(
+        self,
+        max_size: int,
+        device: torch.device,
+        pin_memory: bool,
+        dtype: torch.dtype = torch.int64,
+        pool_size: int = 2,
+    ) -> None:
+        self.max_size = max_size
+        self.device = device
+        self.pin_memory = pin_memory
+        self.dtype = dtype
+        self._pool_size = pool_size
+        self._pool_idx = 0
+        self._cpu_pool = [
+            torch.empty(max_size, dtype=self.dtype, device="cpu", pin_memory=pin_memory)
+            for _ in range(pool_size)
+        ]
+        self._events: list[torch.cuda.Event | None] = [None] * pool_size
+        self.gpu = torch.empty(max_size, dtype=self.dtype, device=device)
+
+    def _acquire_cpu(self) -> tuple[int, torch.Tensor]:
+        for _ in range(self._pool_size):
+            idx = self._pool_idx
+            event = self._events[idx]
+            if event is None or event.query():
+                self._pool_idx = (idx + 1) % self._pool_size
+                return idx, self._cpu_pool[idx]
+            self._pool_idx = (idx + 1) % self._pool_size
+
+        idx = self._pool_idx
+        event = self._events[idx]
+        if event is not None:
+            event.synchronize()
+        self._pool_idx = (idx + 1) % self._pool_size
+        return idx, self._cpu_pool[idx]
+
+    def copy_list_to_gpu(self, values: list[int]) -> torch.Tensor:
+        n = len(values)
+        if n == 0:
+            return self.gpu[:0]
+        if n > self.max_size:
+            raise ValueError(
+                f"Index buffer overflow: {n} > {self.max_size}. "
+                "Increase max_num_tokens/max_num_reqs."
+            )
+        idx, cpu = self._acquire_cpu()
+        cpu[:n].copy_(torch.as_tensor(values, dtype=self.dtype), non_blocking=False)
+        cpu_slice = cpu[:n]
+        gpu_slice = self.gpu[:n]
+        gpu_slice.copy_(cpu_slice, non_blocking=self.pin_memory)
+        if self.pin_memory and self.device.type == "cuda":
+            event = self._events[idx]
+            if event is None:
+                event = torch.cuda.Event(enable_timing=False)
+                self._events[idx] = event
+            event.record(torch.cuda.current_stream(self.device))
+        return gpu_slice
+
+    def copy_numpy_to_gpu(self, values: np.ndarray) -> torch.Tensor:
+        n = values.shape[0]
+        if n == 0:
+            return self.gpu[:0]
+        if n > self.max_size:
+            raise ValueError(
+                f"Index buffer overflow: {n} > {self.max_size}. "
+                "Increase max_num_tokens/max_num_reqs."
+            )
+        idx, cpu = self._acquire_cpu()
+        cpu[:n].copy_(torch.as_tensor(values, dtype=self.dtype), non_blocking=False)
+        cpu_slice = cpu[:n]
+        gpu_slice = self.gpu[:n]
+        gpu_slice.copy_(cpu_slice, non_blocking=self.pin_memory)
+        if self.pin_memory and self.device.type == "cuda":
+            event = self._events[idx]
+            if event is None:
+                event = torch.cuda.Event(enable_timing=False)
+                self._events[idx] = event
+            event.record(torch.cuda.current_stream(self.device))
+        return gpu_slice
+
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -193,6 +279,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
+        pinned_memory_pool: PinnedTensorPool | None,
+        pin_memory: bool,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -210,11 +298,23 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
             async_output_copy_stream.wait_stream(default_stream)
-            self.sampled_token_ids_cpu = self._sampled_token_ids.to(
-                "cpu", non_blocking=True
-            )
+            logprobs_pool = pinned_memory_pool if pin_memory else None
+            if pin_memory and pinned_memory_pool is not None:
+                self.sampled_token_ids_cpu = pinned_memory_pool.acquire(
+                    tuple(self._sampled_token_ids.shape),
+                    dtype=self._sampled_token_ids.dtype,
+                    pin_memory=True,
+                )
+                self.sampled_token_ids_cpu.copy_(
+                    self._sampled_token_ids, non_blocking=True
+                )
+                pinned_memory_pool.record_event_if_managed(self.sampled_token_ids_cpu)
+            else:
+                self.sampled_token_ids_cpu = self._sampled_token_ids.to(
+                    "cpu", non_blocking=pin_memory
+                )
             self._logprobs_tensors_cpu = (
-                self._logprobs_tensors.to_cpu_nonblocking()
+                self._logprobs_tensors.to_cpu_nonblocking(logprobs_pool)
                 if self._logprobs_tensors
                 else None
             )
@@ -352,7 +452,12 @@ class GPUModelRunner(
             self.max_encoder_len = 0
 
         # Sampler
-        self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+        self.sampler = Sampler(
+            logprobs_mode=self.model_config.logprobs_mode,
+            max_num_reqs=self.max_num_reqs,
+            max_output_len=self.max_model_len,
+            device=self.device,
+        )
 
         self.eplb_state: EplbState | None = None
         """
@@ -454,6 +559,45 @@ class GPUModelRunner(
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
+        self.causal_conv1d_buffers = CausalConv1dMetadataBuffers(
+            max_num_tokens=self.max_num_tokens,
+            max_num_reqs=self.max_num_reqs,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            pool_size=16,
+        )
+        self.mm_pinned_memory_pool = PinnedTensorPool(self.device)
+        self.output_pinned_memory_pool = PinnedTensorPool(self.device)
+        self._sampled_tokens_index = _PinnedIndexBuffer(
+            self.max_num_tokens, self.device, self.pin_memory
+        )
+        self._prev_common_req_index = _PinnedIndexBuffer(
+            self.max_num_reqs, self.device, self.pin_memory
+        )
+        self._draft_tokens_index = _PinnedIndexBuffer(
+            self.max_num_tokens, self.device, self.pin_memory
+        )
+        self._prev_draft_token_index = _PinnedIndexBuffer(
+            self.max_num_tokens, self.device, self.pin_memory
+        )
+        self._spec_cu_num_draft_tokens = _PinnedIndexBuffer(
+            self.max_num_reqs, self.device, self.pin_memory, dtype=torch.int32
+        )
+        self._spec_cu_num_sampled_tokens = _PinnedIndexBuffer(
+            self.max_num_reqs, self.device, self.pin_memory, dtype=torch.int32
+        )
+        self._spec_logits_indices = _PinnedIndexBuffer(
+            self.max_num_tokens, self.device, self.pin_memory, dtype=torch.int32
+        )
+        self._spec_target_logits_indices = _PinnedIndexBuffer(
+            self.max_num_tokens, self.device, self.pin_memory, dtype=torch.int32
+        )
+        self._spec_bonus_logits_indices = _PinnedIndexBuffer(
+            self.max_num_tokens, self.device, self.pin_memory, dtype=torch.int32
+        )
+        self._dummy_logit_indices = _PinnedIndexBuffer(
+            self.max_num_tokens, self.device, self.pin_memory, dtype=torch.int64
+        )
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -509,7 +653,13 @@ class GPUModelRunner(
 
         # Only relevant for multimodal models
         if self.supports_mm_inputs:
-            self.is_mm_embed = self._make_buffer(self.max_num_tokens, dtype=torch.bool)
+            # Double buffer to avoid race condition: previous iteration's async
+            # copy may still be reading from CPU while current iteration writes.
+            self.is_mm_embed_buffers = [
+                self._make_buffer(self.max_num_tokens, dtype=torch.bool),
+                self._make_buffer(self.max_num_tokens, dtype=torch.bool),
+            ]
+            self.is_mm_embed_idx = 0
 
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1102,6 +1252,7 @@ class GPUModelRunner(
             mm_kwargs,
             device=self.device,
             pin_memory=self.pin_memory,
+            pinned_memory_pool=self.mm_pinned_memory_pool,
             merge_by_field_config=model.merge_by_field_config,
         ):
             mm_kwargs_combined.update(mm_kwargs_group)
@@ -1223,12 +1374,12 @@ class GPUModelRunner(
                 self.is_token_ids.gpu[:num_commmon_tokens] = True
             return
         # Upload the index tensors asynchronously so the scatter can be non-blocking.
-        sampled_tokens_index_tensor = torch.tensor(
-            sample_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        prev_common_req_indices_tensor = torch.tensor(
-            prev_common_req_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
+        sampled_tokens_index_tensor = self._sampled_tokens_index.copy_list_to_gpu(
+            sample_flattened_indices
+        )
+        prev_common_req_indices_tensor = self._prev_common_req_index.copy_list_to_gpu(
+            prev_common_req_indices
+        )
         self.input_ids.gpu.scatter_(
             dim=0,
             index=sampled_tokens_index_tensor,
@@ -1242,12 +1393,12 @@ class GPUModelRunner(
             return
 
         assert isinstance(self._draft_token_ids, torch.Tensor)
-        draft_tokens_index_tensor = torch.tensor(
-            spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        prev_draft_token_indices_tensor = torch.tensor(
-            prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
+        draft_tokens_index_tensor = self._draft_tokens_index.copy_list_to_gpu(
+            spec_flattened_indices
+        )
+        prev_draft_token_indices_tensor = self._prev_draft_token_index.copy_list_to_gpu(
+            prev_draft_token_indices
+        )
 
         # because input_ids dtype is torch.int32,
         # so convert draft_token_ids to torch.int32 here.
@@ -2014,21 +2165,18 @@ class GPUModelRunner(
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
-        # TODO: Optimize the CPU -> GPU copy.
-        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
-            self.device, non_blocking=True
+        cu_num_draft_tokens = self._spec_cu_num_draft_tokens.copy_numpy_to_gpu(
+            cu_num_draft_tokens
         )
-        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(
-            self.device, non_blocking=True
+        cu_num_sampled_tokens = self._spec_cu_num_sampled_tokens.copy_numpy_to_gpu(
+            cu_num_sampled_tokens
         )
-        logits_indices = torch.from_numpy(logits_indices).to(
-            self.device, non_blocking=True
+        logits_indices = self._spec_logits_indices.copy_numpy_to_gpu(logits_indices)
+        target_logits_indices = self._spec_target_logits_indices.copy_numpy_to_gpu(
+            target_logits_indices
         )
-        target_logits_indices = torch.from_numpy(target_logits_indices).to(
-            self.device, non_blocking=True
-        )
-        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(
-            self.device, non_blocking=True
+        bonus_logits_indices = self._spec_bonus_logits_indices.copy_numpy_to_gpu(
+            bonus_logits_indices
         )
 
         # Compute the draft token ids.
@@ -2134,6 +2282,7 @@ class GPUModelRunner(
             mm_kwargs,
             device=self.device,
             pin_memory=self.pin_memory,
+            pinned_memory_pool=self.mm_pinned_memory_pool,
         ):
             curr_group_outputs: list[torch.Tensor] = []
 
@@ -2159,6 +2308,7 @@ class GPUModelRunner(
                             [video_mm_kwargs_item],
                             device=self.device,
                             pin_memory=self.pin_memory,
+                            pinned_memory_pool=self.mm_pinned_memory_pool,
                         )
                     )
 
@@ -2198,8 +2348,13 @@ class GPUModelRunner(
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
 
+        # Swap to the other buffer to avoid race condition with previous
+        # iteration's async copy that may still be reading from CPU.
+        self.is_mm_embed_idx = 1 - self.is_mm_embed_idx
+        is_mm_embed_buf = self.is_mm_embed_buffers[self.is_mm_embed_idx]
+
         mm_embeds = list[torch.Tensor]()
-        is_mm_embed = self.is_mm_embed.cpu
+        is_mm_embed = is_mm_embed_buf.cpu
         is_mm_embed[:total_num_scheduled_tokens] = False
 
         req_start_idx = 0
@@ -2277,7 +2432,7 @@ class GPUModelRunner(
             mm_embeds.extend(mm_embeds_req)
             req_start_idx += num_scheduled_tokens
 
-        is_mm_embed = self.is_mm_embed.copy_to_gpu(total_num_scheduled_tokens)
+        is_mm_embed = is_mm_embed_buf.copy_to_gpu(total_num_scheduled_tokens)
 
         if should_sync_mrope_positions:
             self._calc_mrope_positions(scheduler_output)
@@ -3326,6 +3481,8 @@ class GPUModelRunner(
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
+                pinned_memory_pool=self.output_pinned_memory_pool,
+                pin_memory=self.pin_memory,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
@@ -3794,8 +3951,9 @@ class GPUModelRunner(
                 continue
 
             num_prompt_tokens = len(request.prompt_token_ids)
-            prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
-                self.device, non_blocking=True
+            prompt_token_ids_cpu = torch.tensor(request.prompt_token_ids)
+            prompt_token_ids = prompt_token_ids_cpu.to(
+                self.device, non_blocking=prompt_token_ids_cpu.is_pinned()
             )
 
             # Set up target LogprobsTensors object.
@@ -3963,6 +4121,7 @@ class GPUModelRunner(
                 dummy_mm_items,
                 device=self.device,
                 pin_memory=self.pin_memory,
+                pinned_memory_pool=self.mm_pinned_memory_pool,
             )
         )
 
@@ -4259,8 +4418,8 @@ class GPUModelRunner(
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        logit_indices_device = torch.from_numpy(logit_indices).to(
-            self.device, non_blocking=True
+        logit_indices_device = self._dummy_logit_indices.copy_numpy_to_gpu(
+            logit_indices
         )
         return hidden_states, hidden_states[logit_indices_device]
 
@@ -4758,6 +4917,7 @@ class GPUModelRunner(
                     num_metadata_builders=1
                     if not self.parallel_config.enable_dbo
                     else 2,
+                    causal_conv1d_buffers=self.causal_conv1d_buffers,
                 )
         # Calculate reorder batch threshold (if needed)
         # Note (tdoublep): do this *after* constructing builders,

@@ -25,6 +25,7 @@ from typing_extensions import NotRequired, TypeVar, deprecated
 from vllm.utils.collection_utils import full_groupby, is_list_of
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.jsontree import json_map_leaves
+from vllm.utils.pinned_memory_pool import PinnedTensorPool
 
 if TYPE_CHECKING:
     import torch
@@ -282,18 +283,31 @@ def nested_tensors_equal(a: NestedTensors, b: NestedTensors) -> bool:
 def _nested_tensors_h2d(
     tensors: NestedTensors,
     device: torch.types.Device,
+    pinned_memory_pool: PinnedTensorPool | None = None,
 ) -> NestedTensors:
     if device is None:
         return tensors
 
     return json_map_leaves(
-        (
-            lambda x: x.to(device=device, non_blocking=True)
-            if isinstance(x, torch.Tensor)
-            else x
-        ),
+        lambda x: _maybe_h2d(x, device, pinned_memory_pool),
         tensors,
     )
+
+
+def _maybe_h2d(
+    tensor: NestedTensors,
+    device: torch.types.Device,
+    pinned_memory_pool: PinnedTensorPool | None,
+) -> NestedTensors:
+    if not isinstance(tensor, torch.Tensor):
+        return tensor
+    if tensor.device.type == "cpu":
+        non_blocking = tensor.is_pinned()
+        out = tensor.to(device=device, non_blocking=non_blocking)
+        if non_blocking and pinned_memory_pool is not None:
+            pinned_memory_pool.record_event_if_managed(tensor)
+        return out
+    return tensor.to(device=device, non_blocking=True)
 
 
 BatchedTensorInputs: TypeAlias = dict[str, NestedTensors]
@@ -458,6 +472,7 @@ class BaseMultiModalField(ABC):
         batch: list[NestedTensors],
         *,
         pin_memory: bool,
+        pinned_memory_pool: PinnedTensorPool | None,
     ) -> NestedTensors:
         raise NotImplementedError
 
@@ -467,6 +482,7 @@ class BaseMultiModalField(ABC):
         *,
         device: torch.types.Device = None,
         pin_memory: bool = False,
+        pinned_memory_pool: PinnedTensorPool | None = None,
     ) -> NestedTensors:
         """
         Merge the data from multiple instances of
@@ -485,8 +501,16 @@ class BaseMultiModalField(ABC):
             pin_memory = False
 
         batch = [elem.data for elem in elems]
-        out = self._reduce_data(batch, pin_memory=pin_memory)
-        return _nested_tensors_h2d(out, device=device)
+        out = self._reduce_data(
+            batch,
+            pin_memory=pin_memory,
+            pinned_memory_pool=pinned_memory_pool,
+        )
+        return _nested_tensors_h2d(
+            out,
+            device=device,
+            pinned_memory_pool=pinned_memory_pool,
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -510,6 +534,7 @@ class MultiModalBatchedField(BaseMultiModalField):
         batch: list[NestedTensors],
         *,
         pin_memory: bool,
+        pinned_memory_pool: PinnedTensorPool | None,
     ) -> NestedTensors:
         if len(batch) > 0 and is_list_of(batch, torch.Tensor, check="all"):
             batch = cast(list[torch.Tensor], batch)
@@ -520,12 +545,22 @@ class MultiModalBatchedField(BaseMultiModalField):
                 return batch[0].unsqueeze(0).contiguous()
             first_shape = batch[0].shape
             if all(elem.shape == first_shape for elem in batch):
-                out = torch.empty(
-                    (len(batch), *batch[0].shape),
-                    dtype=batch[0].dtype,
-                    device=batch[0].device,
-                    pin_memory=pin_memory,
-                )
+                shape = (len(batch), *batch[0].shape)
+                if (
+                    pin_memory
+                    and pinned_memory_pool is not None
+                    and batch[0].device.type == "cpu"
+                ):
+                    out = pinned_memory_pool.acquire(
+                        shape, batch[0].dtype, pin_memory=True
+                    )
+                else:
+                    out = torch.empty(
+                        shape,
+                        dtype=batch[0].dtype,
+                        device=batch[0].device,
+                        pin_memory=pin_memory,
+                    )
                 return torch.stack(batch, out=out)
 
         return batch
@@ -560,6 +595,7 @@ class MultiModalFlatField(BaseMultiModalField):
         batch: list[NestedTensors],
         *,
         pin_memory: bool,
+        pinned_memory_pool: PinnedTensorPool | None,
     ) -> NestedTensors:
         if len(batch) > 0 and is_list_of(batch, torch.Tensor, check="all"):
             batch = cast(list[torch.Tensor], batch)
@@ -579,12 +615,22 @@ class MultiModalFlatField(BaseMultiModalField):
             if all(_shape_before_after(elem) == first_shape for elem in batch):
                 shape_before, shape_after = first_shape
                 shape_concat = sum(item.shape[dim] for item in batch)
-                out = torch.empty(
-                    (*shape_before, shape_concat, *shape_after),
-                    dtype=batch[0].dtype,
-                    device=batch[0].device,
-                    pin_memory=pin_memory,
-                )
+                shape = (*shape_before, shape_concat, *shape_after)
+                if (
+                    pin_memory
+                    and pinned_memory_pool is not None
+                    and batch[0].device.type == "cpu"
+                ):
+                    out = pinned_memory_pool.acquire(
+                        shape, batch[0].dtype, pin_memory=True
+                    )
+                else:
+                    out = torch.empty(
+                        shape,
+                        dtype=batch[0].dtype,
+                        device=batch[0].device,
+                        pin_memory=pin_memory,
+                    )
                 return torch.concat(batch, dim=self.dim, out=out)
 
         assert self.dim == 0, "dim == 0 is required for nested list"
@@ -614,6 +660,7 @@ class MultiModalSharedField(BaseMultiModalField):
         batch: list[NestedTensors],
         *,
         pin_memory: bool,
+        pinned_memory_pool: PinnedTensorPool | None,
     ) -> NestedTensors:
         return batch[0]
 
@@ -954,6 +1001,7 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
         *,
         device: torch.types.Device = None,
         pin_memory: bool = False,
+        pinned_memory_pool: PinnedTensorPool | None = None,
     ) -> BatchedTensorInputs:
         """Construct a dictionary of keyword arguments to pass to the model."""
         elems_by_key = defaultdict[str, list[MultiModalFieldElem]](list)
@@ -972,6 +1020,7 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
                 elems,
                 device=device,
                 pin_memory=pin_memory,
+                pinned_memory_pool=pinned_memory_pool,
             )
             for key, elems in elems_by_key.items()
         }

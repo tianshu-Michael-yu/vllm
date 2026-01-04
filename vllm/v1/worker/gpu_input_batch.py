@@ -14,6 +14,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.collection_utils import swap_dict_values
+from vllm.utils.pinned_memory_pool import FixedPinnedRingBuffer
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import (
@@ -215,6 +216,14 @@ class InputBatch:
             (max_num_reqs,), dtype=torch.int64, device="cpu", pin_memory=pin_memory
         )
         self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
+
+        self._prompt_token_ids_buffer = FixedPinnedRingBuffer(
+            (self.max_num_reqs, self.max_model_len),
+            dtype=torch.int64,
+            device=self.device,
+            slots=2,
+            pin_memory=self.pin_memory,
+        )
 
         # lora related
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
@@ -868,11 +877,8 @@ class InputBatch:
     def _make_prompt_token_ids_tensor(self) -> torch.Tensor:
         num_reqs = self.num_reqs
         max_prompt_len = self.num_prompt_tokens[:num_reqs].max()
-        prompt_token_ids_cpu_tensor = torch.empty(
-            (self.num_reqs, max_prompt_len),
-            device="cpu",
-            dtype=torch.int64,
-            pin_memory=self.pin_memory,
+        idx, prompt_token_ids_cpu_tensor = self._prompt_token_ids_buffer.acquire(
+            (self.num_reqs, max_prompt_len)
         )
         prompt_token_ids = prompt_token_ids_cpu_tensor.numpy()
         prompt_token_ids[:] = self.token_ids_cpu[:num_reqs, :max_prompt_len]
@@ -880,7 +886,11 @@ class InputBatch:
         # token_id of this value.
         for i in range(num_reqs):
             prompt_token_ids[i, self.num_prompt_tokens[i] :] = self.vocab_size
-        return prompt_token_ids_cpu_tensor.to(device=self.device, non_blocking=True)
+        prompt_token_ids_gpu = prompt_token_ids_cpu_tensor.to(
+            device=self.device, non_blocking=self.pin_memory
+        )
+        self._prompt_token_ids_buffer.record(idx)
+        return prompt_token_ids_gpu
 
     def make_lora_inputs(
         self, num_scheduled_tokens: np.ndarray, num_sampled_tokens: np.ndarray

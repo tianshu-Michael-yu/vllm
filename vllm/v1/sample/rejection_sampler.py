@@ -279,8 +279,8 @@ class RejectionSampler(nn.Module):
 
         return logits
 
-    @staticmethod
     def apply_penalties(
+        self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         metadata: SpecDecodeMetadata,
@@ -304,6 +304,11 @@ class RejectionSampler(nn.Module):
             frequency_penalties,
             repetition_penalties,
             output_token_ids,
+            output_token_ids_buffer=self.sampler._get_output_token_ids_buffer(
+                logits.device
+            ),
+            pinned_memory_pool=self.sampler._get_pinned_pool(logits.device),
+            pin_memory=self.sampler.pin_memory,
         )
         return logits
 

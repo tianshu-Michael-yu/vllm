@@ -13,7 +13,13 @@ from huggingface_hub import (
     get_safetensors_metadata,
 )
 from transformers import GenerationConfig, PretrainedConfig
-from transformers.configuration_utils import ALLOWED_LAYER_TYPES
+
+try:
+    from transformers.configuration_utils import ALLOWED_MLP_LAYER_TYPES
+except ImportError:  # transformers < 4.50
+    from transformers.configuration_utils import (
+        ALLOWED_LAYER_TYPES as ALLOWED_MLP_LAYER_TYPES,
+    )
 from transformers.models.auto.image_processing_auto import get_image_processor_config
 from transformers.models.auto.modeling_auto import (
     MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
@@ -333,7 +339,7 @@ def patch_rope_parameters(config: PretrainedConfig) -> None:
         config.rope_parameters["original_max_position_embeddings"] = ompe
 
     # Handle nested rope_parameters in interleaved sliding attention models
-    if set(config.rope_parameters.keys()).issubset(ALLOWED_LAYER_TYPES):
+    if set(config.rope_parameters.keys()).issubset(ALLOWED_MLP_LAYER_TYPES):
         for rope_parameters_layer_type in config.rope_parameters.values():
             patch_rope_parameters_dict(rope_parameters_layer_type)
     else:

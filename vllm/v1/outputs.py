@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.utils.pinned_memory_pool import PinnedTensorPool
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -60,13 +61,46 @@ class LogprobsTensors(NamedTuple):
             cu_num_generated_tokens,
         )
 
-    def to_cpu_nonblocking(self) -> "LogprobsTensors":
+    def to_cpu_nonblocking(
+        self, pinned_memory_pool: "PinnedTensorPool | None" = None
+    ) -> "LogprobsTensors":
         if self.logprob_token_ids.device.type == "cpu":
             return self
+        if pinned_memory_pool is None:
+            return LogprobsTensors(
+                self.logprob_token_ids.to("cpu", non_blocking=True),
+                self.logprobs.to("cpu", non_blocking=True),
+                self.selected_token_ranks.to("cpu", non_blocking=True),
+            )
+
+        logprob_token_ids_cpu = pinned_memory_pool.acquire(
+            self.logprob_token_ids.shape,
+            dtype=self.logprob_token_ids.dtype,
+            pin_memory=True,
+        )
+        logprob_token_ids_cpu.copy_(self.logprob_token_ids, non_blocking=True)
+        pinned_memory_pool.record_event_if_managed(logprob_token_ids_cpu)
+
+        logprobs_cpu = pinned_memory_pool.acquire(
+            self.logprobs.shape,
+            dtype=self.logprobs.dtype,
+            pin_memory=True,
+        )
+        logprobs_cpu.copy_(self.logprobs, non_blocking=True)
+        pinned_memory_pool.record_event_if_managed(logprobs_cpu)
+
+        selected_token_ranks_cpu = pinned_memory_pool.acquire(
+            self.selected_token_ranks.shape,
+            dtype=self.selected_token_ranks.dtype,
+            pin_memory=True,
+        )
+        selected_token_ranks_cpu.copy_(self.selected_token_ranks, non_blocking=True)
+        pinned_memory_pool.record_event_if_managed(selected_token_ranks_cpu)
+
         return LogprobsTensors(
-            self.logprob_token_ids.to("cpu", non_blocking=True),
-            self.logprobs.to("cpu", non_blocking=True),
-            self.selected_token_ranks.to("cpu", non_blocking=True),
+            logprob_token_ids_cpu,
+            logprobs_cpu,
+            selected_token_ranks_cpu,
         )
 
     @staticmethod

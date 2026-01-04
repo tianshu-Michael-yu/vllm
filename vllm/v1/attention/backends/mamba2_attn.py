@@ -134,6 +134,8 @@ class Mamba2AttentionMetadata:
 class Mamba2AttentionMetadataBuilder(
     BaseMambaAttentionMetadataBuilder[Mamba2AttentionMetadata]
 ):
+    SUPPORTS_CAUSAL_CONV1D_BUFFERS = True
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -295,8 +297,13 @@ class Mamba2AttentionMetadataBuilder(
                 last_chunk_indices, device=query_start_loc_p.device, dtype=torch.int32
             )
 
+            assert self.causal_conv1d_buffers is not None
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(query_start_loc_p)
+                compute_causal_conv1d_metadata(
+                    query_start_loc_p_cpu,
+                    query_start_loc_p.device,
+                    self.causal_conv1d_buffers,
+                )
             )
 
         elif (

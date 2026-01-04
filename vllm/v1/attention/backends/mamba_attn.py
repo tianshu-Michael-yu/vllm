@@ -11,6 +11,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
+    CausalConv1dMetadataBuffers,
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
@@ -30,8 +31,15 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         layer_names: list[str],
         vllm_config: VllmConfig,
         device: torch.device,
+        causal_conv1d_buffers: CausalConv1dMetadataBuffers | None = None,
     ):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        super().__init__(
+            kv_cache_spec,
+            layer_names,
+            vllm_config,
+            device,
+            causal_conv1d_buffers=causal_conv1d_buffers,
+        )
 
         assert isinstance(kv_cache_spec, MambaSpec)
         self.compilation_config = vllm_config.compilation_config

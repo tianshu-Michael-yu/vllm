@@ -19,6 +19,7 @@ from PIL import Image, UnidentifiedImageError
 import vllm.envs as envs
 from vllm.connections import HTTPConnection, global_http_connection
 from vllm.logger import init_logger
+from vllm.utils.pinned_memory_pool import PinnedTensorPool
 from vllm.utils.registry import ExtensionManager
 
 from .audio import AudioEmbeddingMediaIO, AudioMediaIO
@@ -412,6 +413,7 @@ def group_mm_kwargs_by_modality(
     *,
     device: torch.types.Device = None,
     pin_memory: bool = False,
+    pinned_memory_pool: PinnedTensorPool | None = None,
     merge_by_field_config: bool | None = None,
     multimodal_cpu_fields: Set[str] | None = None,
 ) -> Generator[tuple[str, int, BatchedTensorInputs], None, None]:
@@ -445,6 +447,7 @@ def group_mm_kwargs_by_modality(
         mm_kwargs_data = mm_kwargs_items.get_data(
             device=device,
             pin_memory=pin_memory,
+            pinned_memory_pool=pinned_memory_pool,
         )
 
         yield modality, len(items_lst), mm_kwargs_data

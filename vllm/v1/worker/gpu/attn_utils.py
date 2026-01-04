@@ -36,6 +36,7 @@ def init_attn_backend(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
     device: torch.device,
+    causal_conv1d_buffers=None,
 ):
     attn_backends: dict[str, type[AttentionBackend]] = {}
     attn_metadata_builders: list[AttentionMetadataBuilder] = []
@@ -50,11 +51,19 @@ def init_attn_backend(
         for layer_name in layer_names:
             attn_backends[layer_name] = attn_backend
 
-        attn_metadata_builder = attn_backend.get_builder_cls()(
+        builder_cls = attn_backend.get_builder_cls()
+        builder_kwargs = {}
+        if causal_conv1d_buffers is not None and getattr(
+            builder_cls, "SUPPORTS_CAUSAL_CONV1D_BUFFERS", False
+        ):
+            builder_kwargs["causal_conv1d_buffers"] = causal_conv1d_buffers
+
+        attn_metadata_builder = builder_cls(
             kv_cache_group_spec.kv_cache_spec,
             layer_names,
             vllm_config,
             device,
+            **builder_kwargs,
         )
         attn_metadata_builders.append(attn_metadata_builder)  # type: ignore
 

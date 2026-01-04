@@ -484,10 +484,13 @@ def isin_list(
     elements: torch.Tensor,
     test_elements_list: list[int],
 ) -> torch.Tensor:
-    test_elements = torch.tensor(
+    test_elements_cpu = torch.tensor(
         test_elements_list,
         pin_memory=is_pin_memory_available(),
-    ).to(device=elements.device, non_blocking=True)
+    )
+    test_elements = test_elements_cpu.to(
+        device=elements.device, non_blocking=test_elements_cpu.is_pinned()
+    )
 
     return torch.isin(elements, test_elements)
 

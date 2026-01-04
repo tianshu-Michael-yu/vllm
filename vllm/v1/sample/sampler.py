@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config.model import LogprobsMode
+from vllm.utils.pinned_memory_pool import FixedPinnedRingBuffer, PinnedTensorPool
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -58,11 +59,73 @@ class Sampler(nn.Module):
     9. Return the final `SamplerOutput`.
     """
 
-    def __init__(self, logprobs_mode: LogprobsMode = "raw_logprobs"):
+    def __init__(
+        self,
+        logprobs_mode: LogprobsMode = "raw_logprobs",
+        *,
+        max_num_reqs: int | None = None,
+        max_output_len: int | None = None,
+        device: torch.device | None = None,
+    ):
         super().__init__()
         self.topk_topp_sampler = TopKTopPSampler(logprobs_mode)
         self.pin_memory = is_pin_memory_available()
         self.logprobs_mode = logprobs_mode
+        self._pinned_pools: dict[tuple[str, int | None], PinnedTensorPool] = {}
+        self._output_token_ids_buffers: dict[
+            tuple[str, int | None], FixedPinnedRingBuffer
+        ] = {}
+        self._max_num_reqs = max_num_reqs
+        self._max_output_len = max_output_len
+        self._device = device
+        if (
+            self.pin_memory
+            and device is not None
+            and device.type == "cuda"
+            and self._max_num_reqs is not None
+            and self._max_output_len is not None
+        ):
+            key = (device.type, device.index)
+            self._output_token_ids_buffers[key] = FixedPinnedRingBuffer(
+                (self._max_num_reqs, self._max_output_len),
+                dtype=torch.int64,
+                device=device,
+                slots=2,
+                pin_memory=True,
+            )
+
+    def _get_pinned_pool(self, device: torch.device) -> PinnedTensorPool | None:
+        if not self.pin_memory or device.type != "cuda":
+            return None
+        key = (device.type, device.index)
+        pool = self._pinned_pools.get(key)
+        if pool is None:
+            pool = PinnedTensorPool(device)
+            self._pinned_pools[key] = pool
+        return pool
+
+    def _get_output_token_ids_buffer(
+        self, device: torch.device
+    ) -> FixedPinnedRingBuffer | None:
+        if (
+            not self.pin_memory
+            or device.type != "cuda"
+            or self._max_num_reqs is None
+            or self._max_output_len is None
+        ):
+            return None
+        key = (device.type, device.index)
+        buf = self._output_token_ids_buffers.get(key)
+        if buf is None:
+            buf = FixedPinnedRingBuffer(
+                (self._max_num_reqs, self._max_output_len),
+                dtype=torch.int64,
+                device=device,
+                slots=2,
+                pin_memory=True,
+            )
+            self._output_token_ids_buffers[key] = buf
+        return buf
 
     def forward(
         self,
@@ -299,8 +362,8 @@ class Sampler(nn.Module):
         logits = self.apply_penalties(logits, sampling_metadata, output_token_ids)
         return logits
 
-    @staticmethod
     def apply_penalties(
+        self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         output_token_ids: list[list[int]],
@@ -316,4 +379,7 @@ class Sampler(nn.Module):
             sampling_metadata.frequency_penalties,
             sampling_metadata.repetition_penalties,
             output_token_ids,
+            output_token_ids_buffer=self._get_output_token_ids_buffer(logits.device),
+            pinned_memory_pool=self._get_pinned_pool(logits.device),
+            pin_memory=self.pin_memory,
         )

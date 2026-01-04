@@ -313,6 +313,8 @@ class AttentionMetadataBuilder(abc.ABC, Generic[M]):
     # If not, set this to None. Otherwise set it to the query
     # length that will be pulled into the front of the batch.
     reorder_batch_threshold: int | None = None
+    # Should this builder be given the causal conv1d buffers?
+    SUPPORTS_CAUSAL_CONV1D_BUFFERS: ClassVar[bool] = False
 
     @abstractmethod
     def __init__(
@@ -321,11 +323,13 @@ class AttentionMetadataBuilder(abc.ABC, Generic[M]):
         layer_names: list[str],
         vllm_config: VllmConfig,
         device: torch.device,
+        causal_conv1d_buffers: "CausalConv1dMetadataBuffers | None" = None,
     ):
         self.kv_cache_spec = kv_cache_spec
         self.layer_names = layer_names
         self.vllm_config = vllm_config
         self.device = device
+        self.causal_conv1d_buffers = causal_conv1d_buffers
 
     @classmethod
     def get_cudagraph_support(
@@ -721,8 +725,10 @@ def make_local_attention_virtual_batches(
 
     return CommonAttentionMetadata(
         query_start_loc_cpu=query_start_loc_cpu,
-        query_start_loc=query_start_loc_cpu.to(device=device, non_blocking=True),
-        seq_lens=seq_lens_cpu.to(device=device, non_blocking=True),
+        query_start_loc=query_start_loc_cpu.to(
+            device=device, non_blocking=query_start_loc_cpu.is_pinned()
+        ),
+        seq_lens=seq_lens_cpu.to(device=device, non_blocking=seq_lens_cpu.is_pinned()),
         num_reqs=len(seq_lens_cpu),
         num_actual_tokens=common_attn_metadata.num_actual_tokens,
         max_query_len=seqlens_q_local.max(),
@@ -779,7 +785,9 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
 
     common_attn_metadata = CommonAttentionMetadata(
         query_start_loc=decode_query_start_loc,
-        query_start_loc_cpu=decode_query_start_loc.to("cpu", non_blocking=True),
+        query_start_loc_cpu=decode_query_start_loc.to(
+            "cpu", non_blocking=decode_query_start_loc.is_pinned()
+        ),
         seq_lens=common_attn_metadata.seq_lens,
         num_reqs=num_reqs,
         num_actual_tokens=total_num_decode_tokens,
@@ -1124,50 +1132,148 @@ def create_fast_prefill_custom_backend(
     return attn_backend
 
 
-def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
-    # Needed for causal_conv1d
-    seqlens = query_start_loc_p.diff().to("cpu")
+class CausalConv1dMetadataBuffers:
+    def __init__(
+        self,
+        max_num_tokens: int,
+        max_num_reqs: int,
+        device: torch.device,
+        pin_memory: bool = True,
+        block_m: int = 8,
+        pool_size: int = 2,
+    ) -> None:
+        self.device = device
+        self.pin_memory = pin_memory
+        self.block_m = block_m
+        self.max_mlist_len = cdiv(max_num_tokens, block_m) + max_num_reqs
+        self.max_num_programs = max(1024, self.max_mlist_len) * 2
+        self._pool_size = pool_size
+        self._pool_idx = 0
+        self._cpu_pool: list[dict[str, torch.Tensor | torch.cuda.Event | None]] = []
+        for _ in range(pool_size):
+            self._cpu_pool.append(
+                {
+                    "mlist": torch.empty(
+                        self.max_mlist_len,
+                        dtype=torch.int32,
+                        device="cpu",
+                        pin_memory=pin_memory,
+                    ),
+                    "offsetlist": torch.empty(
+                        self.max_mlist_len,
+                        dtype=torch.int32,
+                        device="cpu",
+                        pin_memory=pin_memory,
+                    ),
+                    "event": None,
+                }
+            )
+
+        self.batch_ptr = torch.full(
+            (self.max_num_programs,), PAD_SLOT_ID, dtype=torch.int32, device=device
+        )
+        self.token_chunk_offset_ptr = torch.full(
+            (self.max_num_programs,), PAD_SLOT_ID, dtype=torch.int32, device=device
+        )
+
+    def acquire_cpu_buffers(
+        self, mlist_len: int
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        if mlist_len > self.max_mlist_len:
+            raise ValueError(
+                "mlist_len exceeds preallocated capacity: "
+                f"{mlist_len} > {self.max_mlist_len}"
+            )
+
+        for _ in range(self._pool_size):
+            idx = self._pool_idx
+            slot = self._cpu_pool[idx]
+            event = slot["event"]
+            if event is None or event.query():
+                self._pool_idx = (idx + 1) % self._pool_size
+                return slot["mlist"], slot["offsetlist"], idx  # type: ignore[return-value]
+            self._pool_idx = (idx + 1) % self._pool_size
+
+        idx = self._pool_idx
+        slot = self._cpu_pool[idx]
+        event = slot["event"]
+        if event is not None:
+            event.synchronize()
+        self._pool_idx = (idx + 1) % self._pool_size
+        return slot["mlist"], slot["offsetlist"], idx  # type: ignore[return-value]
+
+    def record_event(self, idx: int) -> None:
+        if self.device.type != "cuda" or not self.pin_memory:
+            return
+        event = self._cpu_pool[idx]["event"]
+        if event is None:
+            event = torch.cuda.Event(enable_timing=False)
+            self._cpu_pool[idx]["event"] = event
+        event.record(torch.cuda.current_stream(self.device))
+
+
+def compute_causal_conv1d_metadata(
+    query_start_loc_cpu: torch.Tensor,
+    device: torch.device,
+    buffers: CausalConv1dMetadataBuffers,
+):
+    # query_start_loc_cpu is CPU, so no DtoH here
+    assert not query_start_loc_cpu.is_cuda, "query_start_loc_cpu must be a CPU tensor"
+
+    seqlens = query_start_loc_cpu.diff()  # stays on CPU
     nums_dict = {}  # type: ignore
-    batch_ptr = None
-    token_chunk_offset_ptr = None
-    device = query_start_loc_p.device
-    for BLOCK_M in [8]:  # cover all BLOCK_M values
-        nums = -(-seqlens // BLOCK_M)
+    assert buffers.device == device, "buffers device mismatch"
+    batch_ptr = buffers.batch_ptr
+    token_chunk_offset_ptr = buffers.token_chunk_offset_ptr
+
+    for BLOCK_M in [8]:  # keep as original, or use BLOCK_Ms
+        nums = -(-seqlens // BLOCK_M)  # CPU
+        nums = nums.to(torch.int32)  # counts/indices as int32 (helps later)
+
         nums_dict[BLOCK_M] = {}
         nums_dict[BLOCK_M]["nums"] = nums
         nums_dict[BLOCK_M]["tot"] = nums.sum().item()
-        mlist = torch.from_numpy(np.repeat(np.arange(len(nums)), nums))
-        nums_dict[BLOCK_M]["mlist"] = mlist
-        mlist_len = len(nums_dict[BLOCK_M]["mlist"])
+
+        # mlist on CPU, then copy into a reusable pinned buffer
+        repeats = nums.to(torch.int64)
+        mlist = torch.repeat_interleave(
+            torch.arange(nums.numel(), dtype=torch.int32), repeats
+        )
+        mlist_len = len(mlist)
         nums_dict[BLOCK_M]["mlist_len"] = mlist_len
         MAX_NUM_PROGRAMS = max(1024, mlist_len) * 2
-        offsetlist = []  # type: ignore
-        for idx, num in enumerate(nums):
-            offsetlist.extend(range(num))
-        offsetlist = torch.tensor(offsetlist, dtype=torch.int32)
-        nums_dict[BLOCK_M]["offsetlist"] = offsetlist
-
-        if batch_ptr is None:
-            # Update default value after class definition
-            batch_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
+        if buffers.max_num_programs < MAX_NUM_PROGRAMS:
+            raise ValueError(
+                "MAX_NUM_PROGRAMS exceeds preallocated capacity: "
+                f"{MAX_NUM_PROGRAMS} > {buffers.max_num_programs}"
             )
-            token_chunk_offset_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
-            )
-        else:
-            if batch_ptr.nelement() < MAX_NUM_PROGRAMS:
-                batch_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
-                token_chunk_offset_ptr.resize_(  # type: ignore
-                    MAX_NUM_PROGRAMS
-                ).fill_(PAD_SLOT_ID)
+        mlist_pinned, offset_pinned, pool_idx = buffers.acquire_cpu_buffers(mlist_len)
+        mlist_pinned[:mlist_len].copy_(mlist, non_blocking=False)
+        nums_dict[BLOCK_M]["mlist"] = mlist_pinned[:mlist_len]
 
-        batch_ptr[0:mlist_len].copy_(mlist)
-        token_chunk_offset_ptr[  # type: ignore
-            0:mlist_len
-        ].copy_(offsetlist)
+        # offsetlist on CPU, then copy into a reusable pinned buffer
+        offset_base = torch.cumsum(nums, 0) - nums
+        offsetlist = torch.arange(
+            mlist_len, dtype=torch.int32
+        ) - torch.repeat_interleave(offset_base, repeats)
+        offset_pinned[:mlist_len].copy_(offsetlist, non_blocking=False)
+        nums_dict[BLOCK_M]["offsetlist"] = offset_pinned[:mlist_len]
+
+        batch_ptr.fill_(PAD_SLOT_ID)
+        token_chunk_offset_ptr.fill_(PAD_SLOT_ID)
+
+        # Key fix: copy from pinned CPU using non_blocking=True
+        non_blocking = buffers.pin_memory
+        batch_ptr[0:mlist_len].copy_(
+            mlist_pinned[:mlist_len], non_blocking=non_blocking
+        )
+        token_chunk_offset_ptr[0:mlist_len].copy_(
+            offset_pinned[:mlist_len], non_blocking=non_blocking
+        )
+        buffers.record_event(pool_idx)
+
         nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
-        nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr  # type: ignore
+        nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr
 
     return nums_dict, batch_ptr, token_chunk_offset_ptr
 

@@ -10,7 +10,8 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import Siglip2VisionConfig
 
-from vllm.attention.layer import MultiHeadAttention
+from vllm.attention.layers.mm_encoder_attention import MMEncoderAttention
+from vllm.compilation.decorators import support_torch_compile
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (
@@ -21,7 +22,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from .vision import run_dp_sharded_vision_model
+from .vision import should_torch_compile_mm_vit
 
 
 class Siglip2VisionEmbeddings(nn.Module):
@@ -174,21 +175,43 @@ class Siglip2Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        self.attn = MultiHeadAttention(
-            self.num_heads_per_partition, self.head_dim, self.scale
+        self.attn = MMEncoderAttention(
+            num_heads=self.num_heads_per_partition,
+            head_size=self.head_dim,
+            scale=self.scale,
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(
             hidden_states
         )  # batch_size, q_len, 3 * num_heads_per_partition * head_dim
+        bsz, q_len, _ = qkv.shape
         query_states, key_states, value_states = qkv.chunk(3, dim=-1)
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads_per_partition, self.head_dim
+        )
+        key_states = key_states.view(
+            bsz, q_len, self.num_heads_per_partition, self.head_dim
+        )
+        value_states = value_states.view(
+            bsz, q_len, self.num_heads_per_partition, self.head_dim
+        )
 
         # Use unified MultiHeadAttention implementation
-        out = self.attn(query_states, key_states, value_states)
+        out = self.attn(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        out = out.reshape(bsz, q_len, -1)
         attn_output, _ = self.out_proj(out)
         return attn_output
 
@@ -226,6 +249,10 @@ class Siglip2MLP(nn.Module):
         return hidden_states
 
 
+@support_torch_compile(
+    dynamic_arg_dims={"hidden_states": [0, 1], "cu_seqlens": 0},
+    enable_if=should_torch_compile_mm_vit,
+)
 class Siglip2EncoderLayer(nn.Module):
     def __init__(
         self,
@@ -254,7 +281,8 @@ class Siglip2EncoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        # attention_mask: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
@@ -267,7 +295,8 @@ class Siglip2EncoderLayer(nn.Module):
         hidden_states = self.layer_norm1(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
-            # attention_mask=attention_mask,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
         hidden_states = residual + hidden_states
 
@@ -299,7 +328,7 @@ class Siglip2Encoder(nn.Module):
         self.layers = nn.ModuleList(
             [
                 Siglip2EncoderLayer(
-                    config,
+                    config=config,
                     quant_config=quant_config,
                     prefix=f"{prefix}.layers.{idx}",
                     use_data_parallel=use_data_parallel,
@@ -311,10 +340,16 @@ class Siglip2Encoder(nn.Module):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            layer_outputs = encoder_layer(hidden_states)
+            layer_outputs = encoder_layer(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
             hidden_states = layer_outputs
         return hidden_states
 
@@ -325,19 +360,21 @@ class Siglip2VisionTransformer(nn.Module):
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
     ):
         super().__init__()
         embed_dim = config.hidden_size
         self.config = config
-        self.use_data_parallel = use_data_parallel
         self.embeddings = Siglip2VisionEmbeddings(config)
-        self.encoder = Siglip2Encoder(
-            config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.encoder",
-            use_data_parallel=use_data_parallel,
-        )
+        # Keep the import local to avoid circular dependencies during model init.
+        from vllm.compilation.backends import set_model_tag
+
+        with set_model_tag("Siglip2Encoder", is_encoder=True):
+            self.encoder = Siglip2Encoder(
+                config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.encoder",
+                use_data_parallel=False,
+            )
         num_hidden_layers = config.num_hidden_layers
         if len(self.encoder.layers) > config.num_hidden_layers:
             raise ValueError(
@@ -353,8 +390,10 @@ class Siglip2VisionTransformer(nn.Module):
     def forward(
         self,
         pixel_values: torch.FloatTensor,
-        # attention_mask: torch.Tensor,
         spatial_shapes: torch.LongTensor,
+        packed_mask: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | torch.Tensor,
     ) -> torch.Tensor:
         r"""
         spatial_shapes (`torch.LongTensor` of shape `(batch_size, 2)`):
@@ -362,10 +401,22 @@ class Siglip2VisionTransformer(nn.Module):
             of the input images.
         """
         hidden_states = self.embeddings(pixel_values, spatial_shapes)
-        if self.use_data_parallel:
-            encoder_outputs = run_dp_sharded_vision_model(hidden_states, self.encoder)
-        else:
-            encoder_outputs = self.encoder(inputs_embeds=hidden_states)
+        flat_mask = packed_mask.view(-1)
+        packed_indices = flat_mask.nonzero(as_tuple=True)[0]
+        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = flat_hidden_states.index_select(0, packed_indices).unsqueeze(0)
+        encoder_outputs = self.encoder(
+            inputs_embeds=hidden_states,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        unpacked = encoder_outputs.new_zeros(
+            packed_mask.numel(), encoder_outputs.shape[-1]
+        )
+        unpacked.index_copy_(0, packed_indices, encoder_outputs.squeeze(0))
+        encoder_outputs = unpacked.view(
+            packed_mask.shape + (encoder_outputs.shape[-1],)
+        )
         last_hidden_state = self.post_layernorm(encoder_outputs)
         return last_hidden_state
 
@@ -376,7 +427,6 @@ class Siglip2Model(torch.nn.Module):
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
     ):
         super().__init__()
 
@@ -384,19 +434,22 @@ class Siglip2Model(torch.nn.Module):
             config,
             quant_config=quant_config,
             prefix=f"{prefix}.vision_model",
-            use_data_parallel=use_data_parallel,
         )
 
     def forward(
         self,
         pixel_values: torch.FloatTensor,
-        pixel_attention_mask: torch.Tensor,
         spatial_shapes: torch.LongTensor,
+        packed_mask: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | torch.Tensor,
     ) -> torch.Tensor:
         return self.vision_model(
             pixel_values=pixel_values,
-            # attention_mask=pixel_attention_mask,
             spatial_shapes=spatial_shapes,
+            packed_mask=packed_mask,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
