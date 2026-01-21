@@ -3,13 +3,12 @@
 from collections.abc import Sequence
 from typing import Any, cast
 
-import numpy as np
 import torch
 
-from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.v1.attention.backends.utils import (
+from vllm.v1.attention.backend import (
+    AttentionBackend,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
@@ -36,7 +35,6 @@ def init_attn_backend(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
     device: torch.device,
-    causal_conv1d_buffers=None,
 ):
     attn_backends: dict[str, type[AttentionBackend]] = {}
     attn_metadata_builders: list[AttentionMetadataBuilder] = []
@@ -51,23 +49,15 @@ def init_attn_backend(
         for layer_name in layer_names:
             attn_backends[layer_name] = attn_backend
 
-        builder_cls = attn_backend.get_builder_cls()
-        builder_kwargs = {}
-        if causal_conv1d_buffers is not None and getattr(
-            builder_cls, "SUPPORTS_CAUSAL_CONV1D_BUFFERS", False
-        ):
-            builder_kwargs["causal_conv1d_buffers"] = causal_conv1d_buffers
-
-        attn_metadata_builder = builder_cls(
+        attn_metadata_builder = attn_backend.get_builder_cls()(
             kv_cache_group_spec.kv_cache_spec,
             layer_names,
             vllm_config,
             device,
-            **builder_kwargs,
         )
         attn_metadata_builders.append(attn_metadata_builder)  # type: ignore
 
-        if "FLASHINFER" in attn_backend.get_name():
+        if attn_backend.get_name() == "FLASHINFER":
             if flashinfer_workspace is None:
                 flashinfer_workspace = attn_metadata_builder._get_workspace_buffer()
             else:
@@ -156,16 +146,13 @@ def build_attn_metadata(
     query_start_loc_gpu: torch.Tensor,
     query_start_loc_cpu: torch.Tensor,
     seq_lens: torch.Tensor,
-    seq_lens_np: np.ndarray,
-    num_computed_tokens_cpu: torch.Tensor | None,
+    max_seq_len: int,
     block_tables: Sequence[torch.Tensor],
     slot_mappings: torch.Tensor,
     kv_cache_config: KVCacheConfig,
 ) -> dict[str, Any]:
     max_query_len = int(query_start_loc_cpu.max())
     seq_lens = seq_lens[:num_reqs]
-    seq_lens_cpu = torch.from_numpy(seq_lens_np)
-    max_seq_len = int(seq_lens_np.max())
 
     attn_metadata: dict[str, Any] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
@@ -177,9 +164,7 @@ def build_attn_metadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens=seq_lens,
-            _seq_lens_cpu=seq_lens_cpu,
             max_seq_len=max_seq_len,
-            _num_computed_tokens_cpu=num_computed_tokens_cpu,
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,

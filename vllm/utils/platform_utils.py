@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import multiprocessing
-import os
 from collections.abc import Sequence
 from concurrent.futures.process import ProcessPoolExecutor
 from functools import cache
@@ -49,8 +48,6 @@ def cuda_get_device_properties(
 def is_pin_memory_available() -> bool:
     from vllm.platforms import current_platform
 
-    if os.environ.get("VLLM_DISABLE_PIN_MEMORY") == "1":
-        return False
     return current_platform.is_pin_memory_available()
 
 

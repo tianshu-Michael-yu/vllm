@@ -4,7 +4,7 @@
 import pickle
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from itertools import chain
 from multiprocessing import shared_memory
@@ -126,6 +126,7 @@ class SingleWriterShmRingBuffer:
         self.data_buffer_end = 0
 
         if create:
+            logger.debug("Creating new shared memory buffer: %s", name)
             # we are creating a buffer
             self.metadata: dict[int, int] = {}  # monotonic_id -> start address
             self.shared_memory = shared_memory.SharedMemory(
@@ -169,11 +170,16 @@ class SingleWriterShmRingBuffer:
         self.data_buffer_start = 0
         self.data_buffer_end = 0
 
-    def __del__(self):
+    def close(self) -> None:
+        """Close the shared memory."""
         if hasattr(self, "shared_memory"):
             self.shared_memory.close()
             if self.is_writer:
-                self.shared_memory.unlink()
+                with suppress(FileNotFoundError):
+                    self.shared_memory.unlink()
+
+    def __del__(self):
+        self.close()
 
     def int2byte(self, integer: int) -> bytes:
         """Convert an integer to bytes."""
@@ -344,9 +350,6 @@ class MsgpackSerde(ObjectSerde):
         self.encoder = MsgpackEncoder()
         self.tensor_decoder = MsgpackDecoder(torch.Tensor, share_mem=False)
         self.mm_decoder = MsgpackDecoder(MultiModalKwargsItem, share_mem=False)
-        # Avoid per-request cudaHostAlloc churn when decoding cached tensors.
-        self.tensor_decoder.pin_tensors = False
-        self.mm_decoder.pin_tensors = False
         self._mm_kwargs_item_cls = MultiModalKwargsItem
 
     def serialize(self, value: Any) -> tuple[bytes | list[bytes], int, bytes, int]:
@@ -665,6 +668,10 @@ class SingleWriterShmObjectStorage:
                 # pre-touch has no effect on writer side
                 if reader_count >= self.n_readers:
                     self.increment_reader_flag(data_view[: self.flag_bytes])
+
+    def close(self) -> None:
+        """Close the shared memory."""
+        self.ring_buffer.close()
 
     def handle(self):
         """Get handle for sharing across processes."""

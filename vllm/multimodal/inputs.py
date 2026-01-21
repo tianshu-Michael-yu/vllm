@@ -20,12 +20,11 @@ from typing import (
 )
 
 import numpy as np
-from typing_extensions import NotRequired, TypeVar, deprecated
+from typing_extensions import NotRequired, TypeVar
 
 from vllm.utils.collection_utils import full_groupby, is_list_of
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.jsontree import json_map_leaves
-from vllm.utils.pinned_memory_pool import PinnedTensorPool
 
 if TYPE_CHECKING:
     import torch
@@ -33,9 +32,7 @@ if TYPE_CHECKING:
     from PIL.Image import Image
     from transformers.feature_extraction_utils import BatchFeature
 
-    from .base import MediaWithBytes
-    from .processing import MultiModalHashes
-
+    from .media import MediaWithBytes
 else:
     torch = LazyLoader("torch", globals(), "torch")
 
@@ -172,10 +169,7 @@ class PlaceholderRange:
 
     @cached_property
     def embeds_cumsum(self) -> torch.Tensor | None:
-        if self.is_embed is None:
-            return None
-
-        return self.is_embed.cumsum(dim=0)
+        return None if self.is_embed is None else self.is_embed.cumsum(dim=0)
 
     @cached_property
     def get_num_embeds(self) -> int:
@@ -283,31 +277,18 @@ def nested_tensors_equal(a: NestedTensors, b: NestedTensors) -> bool:
 def _nested_tensors_h2d(
     tensors: NestedTensors,
     device: torch.types.Device,
-    pinned_memory_pool: PinnedTensorPool | None = None,
 ) -> NestedTensors:
     if device is None:
         return tensors
 
     return json_map_leaves(
-        lambda x: _maybe_h2d(x, device, pinned_memory_pool),
+        (
+            lambda x: x.to(device=device, non_blocking=True)
+            if isinstance(x, torch.Tensor)
+            else x
+        ),
         tensors,
     )
-
-
-def _maybe_h2d(
-    tensor: NestedTensors,
-    device: torch.types.Device,
-    pinned_memory_pool: PinnedTensorPool | None,
-) -> NestedTensors:
-    if not isinstance(tensor, torch.Tensor):
-        return tensor
-    if tensor.device.type == "cpu":
-        non_blocking = tensor.is_pinned()
-        out = tensor.to(device=device, non_blocking=non_blocking)
-        if non_blocking and pinned_memory_pool is not None:
-            pinned_memory_pool.record_event_if_managed(tensor)
-        return out
-    return tensor.to(device=device, non_blocking=True)
 
 
 BatchedTensorInputs: TypeAlias = dict[str, NestedTensors]
@@ -322,13 +303,7 @@ def batched_tensors_equal(a: BatchedTensorInputs, b: BatchedTensorInputs) -> boo
     Equality check between
     [`BatchedTensorInputs`][vllm.multimodal.inputs.BatchedTensorInputs] objects.
     """
-    for k in a:
-        if k not in b:
-            return False
-        if not nested_tensors_equal(a[k], b[k]):
-            return False
-
-    return True
+    return all(k in b and nested_tensors_equal(a[k], b[k]) for k in a)
 
 
 @dataclass
@@ -353,6 +328,9 @@ class MultiModalFeatureSpec:
     mm_position: PlaceholderRange
     """e.g., PlaceholderRange(offset=2, length=336)"""
 
+    mm_hash: str | None = None
+    """Base mm_hash for processor cache (without LoRA prefix)."""
+
     @staticmethod
     def gather_kwargs(features: list["MultiModalFeatureSpec"], keys: set[str]):
         kwargs = defaultdict[str, list[NestedTensors]](list)
@@ -370,8 +348,8 @@ class MultiModalFeatureSpec:
 @dataclass
 class MultiModalFieldElem:
     """
-    Represents a keyword argument corresponding to a multi-modal item
-    in [`MultiModalKwargs`][vllm.multimodal.inputs.MultiModalKwargs].
+    Represents a keyword argument inside a
+    [`MultiModalKwargsItem`][vllm.multimodal.inputs.MultiModalKwargsItem].
     """
 
     modality: str
@@ -383,14 +361,14 @@ class MultiModalFieldElem:
     key: str
     """
     The key of this field in
-    [`MultiModalKwargs`][vllm.multimodal.inputs.MultiModalKwargs],
+    [`MultiModalKwargsItem`][vllm.multimodal.inputs.MultiModalKwargsItem],
     i.e. the name of the keyword argument to be passed to the model.
     """
 
     data: NestedTensors
     """
     The tensor data of this field in
-    [`MultiModalKwargs`][vllm.multimodal.inputs.MultiModalKwargs],
+    [`MultiModalKwargsItem`][vllm.multimodal.inputs.MultiModalKwargsItem],
     i.e. the value of the keyword argument to be passed to the model.
 
     It may be set to `None` if it is determined that the item is cached
@@ -424,9 +402,9 @@ class MultiModalFieldElem:
 @dataclass(frozen=True, kw_only=True)
 class BaseMultiModalField(ABC):
     """
-    Defines how to interpret tensor data belonging to a keyword argument in
-    [`MultiModalKwargs`][vllm.multimodal.inputs.MultiModalKwargs] for multiple
-    multi-modal items, and vice versa.
+    Defines how to interpret tensor data belonging to a keyword argument for
+    [`MultiModalKwargsItems`][vllm.multimodal.inputs.MultiModalKwargsItems],
+    and vice versa.
     """
 
     keep_on_cpu: bool = False
@@ -472,7 +450,6 @@ class BaseMultiModalField(ABC):
         batch: list[NestedTensors],
         *,
         pin_memory: bool,
-        pinned_memory_pool: PinnedTensorPool | None,
     ) -> NestedTensors:
         raise NotImplementedError
 
@@ -482,7 +459,6 @@ class BaseMultiModalField(ABC):
         *,
         device: torch.types.Device = None,
         pin_memory: bool = False,
-        pinned_memory_pool: PinnedTensorPool | None = None,
     ) -> NestedTensors:
         """
         Merge the data from multiple instances of
@@ -501,16 +477,8 @@ class BaseMultiModalField(ABC):
             pin_memory = False
 
         batch = [elem.data for elem in elems]
-        out = self._reduce_data(
-            batch,
-            pin_memory=pin_memory,
-            pinned_memory_pool=pinned_memory_pool,
-        )
-        return _nested_tensors_h2d(
-            out,
-            device=device,
-            pinned_memory_pool=pinned_memory_pool,
-        )
+        out = self._reduce_data(batch, pin_memory=pin_memory)
+        return _nested_tensors_h2d(out, device=device)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -534,7 +502,6 @@ class MultiModalBatchedField(BaseMultiModalField):
         batch: list[NestedTensors],
         *,
         pin_memory: bool,
-        pinned_memory_pool: PinnedTensorPool | None,
     ) -> NestedTensors:
         if len(batch) > 0 and is_list_of(batch, torch.Tensor, check="all"):
             batch = cast(list[torch.Tensor], batch)
@@ -545,22 +512,12 @@ class MultiModalBatchedField(BaseMultiModalField):
                 return batch[0].unsqueeze(0).contiguous()
             first_shape = batch[0].shape
             if all(elem.shape == first_shape for elem in batch):
-                shape = (len(batch), *batch[0].shape)
-                if (
-                    pin_memory
-                    and pinned_memory_pool is not None
-                    and batch[0].device.type == "cpu"
-                ):
-                    out = pinned_memory_pool.acquire(
-                        shape, batch[0].dtype, pin_memory=True
-                    )
-                else:
-                    out = torch.empty(
-                        shape,
-                        dtype=batch[0].dtype,
-                        device=batch[0].device,
-                        pin_memory=pin_memory,
-                    )
+                out = torch.empty(
+                    (len(batch), *batch[0].shape),
+                    dtype=batch[0].dtype,
+                    device=batch[0].device,
+                    pin_memory=pin_memory,
+                )
                 return torch.stack(batch, out=out)
 
         return batch
@@ -595,7 +552,6 @@ class MultiModalFlatField(BaseMultiModalField):
         batch: list[NestedTensors],
         *,
         pin_memory: bool,
-        pinned_memory_pool: PinnedTensorPool | None,
     ) -> NestedTensors:
         if len(batch) > 0 and is_list_of(batch, torch.Tensor, check="all"):
             batch = cast(list[torch.Tensor], batch)
@@ -615,22 +571,12 @@ class MultiModalFlatField(BaseMultiModalField):
             if all(_shape_before_after(elem) == first_shape for elem in batch):
                 shape_before, shape_after = first_shape
                 shape_concat = sum(item.shape[dim] for item in batch)
-                shape = (*shape_before, shape_concat, *shape_after)
-                if (
-                    pin_memory
-                    and pinned_memory_pool is not None
-                    and batch[0].device.type == "cpu"
-                ):
-                    out = pinned_memory_pool.acquire(
-                        shape, batch[0].dtype, pin_memory=True
-                    )
-                else:
-                    out = torch.empty(
-                        shape,
-                        dtype=batch[0].dtype,
-                        device=batch[0].device,
-                        pin_memory=pin_memory,
-                    )
+                out = torch.empty(
+                    (*shape_before, shape_concat, *shape_after),
+                    dtype=batch[0].dtype,
+                    device=batch[0].device,
+                    pin_memory=pin_memory,
+                )
                 return torch.concat(batch, dim=self.dim, out=out)
 
         assert self.dim == 0, "dim == 0 is required for nested list"
@@ -660,7 +606,6 @@ class MultiModalSharedField(BaseMultiModalField):
         batch: list[NestedTensors],
         *,
         pin_memory: bool,
-        pinned_memory_pool: PinnedTensorPool | None,
     ) -> NestedTensors:
         return batch[0]
 
@@ -1001,7 +946,6 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
         *,
         device: torch.types.Device = None,
         pin_memory: bool = False,
-        pinned_memory_pool: PinnedTensorPool | None = None,
     ) -> BatchedTensorInputs:
         """Construct a dictionary of keyword arguments to pass to the model."""
         elems_by_key = defaultdict[str, list[MultiModalFieldElem]](list)
@@ -1020,7 +964,6 @@ class MultiModalKwargsItems(UserDict[str, Sequence[_I]]):
                 elems,
                 device=device,
                 pin_memory=pin_memory,
-                pinned_memory_pool=pinned_memory_pool,
             )
             for key, elems in elems_by_key.items()
         }
@@ -1034,65 +977,15 @@ MultiModalKwargsOptionalItems: TypeAlias = (
 )
 
 
-@deprecated("`MultiModalKwargs` is deprecated and will be removed in v0.14.")
-class MultiModalKwargs(UserDict[str, NestedTensors]):
-    """
-    A dictionary that represents the keyword arguments to
-    [`torch.nn.Module.forward`][].
-    """
-
-    @staticmethod
-    @deprecated(
-        "`MultiModalKwargs.from_hf_inputs` is deprecated and "
-        "will be removed in v0.14. "
-        "Please use `MultiModalKwargsItems.from_hf_inputs` and "
-        "access the tensor data using `.get_data()`."
-    )
-    def from_hf_inputs(
-        hf_inputs: "BatchFeature",
-        config_by_key: Mapping[str, MultiModalFieldConfig],
-    ):
-        return MultiModalKwargsItems.from_hf_inputs(hf_inputs, config_by_key).get_data()
-
-    @staticmethod
-    @deprecated(
-        "`MultiModalKwargs.from_items` is deprecated and "
-        "will be removed in v0.14. "
-        "Please use `MultiModalKwargsItems.from_seq` and "
-        "access the tensor data using `.get_data()`."
-    )
-    def from_items(
-        items: Sequence[MultiModalKwargsItem],
-        *,
-        pin_memory: bool = False,
-    ):
-        return MultiModalKwargsItems.from_seq(items).get_data(pin_memory=pin_memory)
-
-    def __getitem__(self, key: str):
-        if key not in self:
-            raise KeyError(
-                f"Keyword argument {key!r} not found. "
-                f"Available keys: {set(self.keys())}"
-            )
-
-        return super().__getitem__(key)
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, self.__class__):
-            return False
-
-        for k in self:
-            if k not in other:
-                return False
-            if not nested_tensors_equal(self[k], other[k]):
-                return False
-
-        return True
+MultiModalHashes = dict[str, list[str]]
+"""
+A dictionary containing per-item hashes for each modality.
+"""
 
 
 MultiModalPlaceholderDict: TypeAlias = Mapping[str, Sequence[PlaceholderRange]]
 """
-A dictionary containing placeholder ranges for each modality.
+A dictionary containing per-item placeholder ranges for each modality.
 """
 
 
@@ -1112,10 +1005,10 @@ class MultiModalInputs(TypedDict):
     mm_kwargs: MultiModalKwargsOptionalItems
     """Keyword arguments to be directly passed to the model after batching."""
 
-    mm_hashes: "MultiModalHashes"
+    mm_hashes: MultiModalHashes
     """The hashes of the multi-modal data."""
 
-    mm_placeholders: "MultiModalPlaceholderDict"
+    mm_placeholders: MultiModalPlaceholderDict
     """
     For each modality, information about the placeholder tokens in
     `prompt_token_ids`.

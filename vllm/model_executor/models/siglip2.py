@@ -10,10 +10,11 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import Siglip2VisionConfig
 
-from vllm.attention.layers.mm_encoder_attention import MMEncoderAttention
 from vllm.compilation.decorators import support_torch_compile
+from vllm.config import MultiModalConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -141,8 +142,8 @@ class Siglip2Attention(nn.Module):
         self,
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -158,6 +159,10 @@ class Siglip2Attention(nn.Module):
         self.scale = self.head_dim**-0.5
         self.dropout = config.attention_dropout
 
+        use_data_parallel = (
+            multimodal_config is not None
+            and multimodal_config.mm_encoder_tp_mode == "data"
+        )
         tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
         assert self.num_heads % tp_size == 0
         self.num_heads_per_partition = self.num_heads // tp_size
@@ -168,18 +173,21 @@ class Siglip2Attention(nn.Module):
             total_num_heads=self.num_heads,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            disable_tp=use_data_parallel,
         )
         self.out_proj = RowParallelLinear(
             input_size=self.embed_dim,
             output_size=self.embed_dim,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
+            disable_tp=use_data_parallel,
         )
         self.attn = MMEncoderAttention(
             num_heads=self.num_heads_per_partition,
             head_size=self.head_dim,
             scale=self.scale,
             prefix=f"{prefix}.attn",
+            multimodal_config=multimodal_config,
         )
 
     def forward(
@@ -221,25 +229,29 @@ class Siglip2MLP(nn.Module):
         self,
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.config = config
         self.activation_fn = get_act_fn(config.hidden_act)
-        # TODO(Isotr0py): Enable data parallel after we support
-        # disabling TP on parallel linear layer
+        use_data_parallel = (
+            multimodal_config is not None
+            and multimodal_config.mm_encoder_tp_mode == "data"
+        )
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
             quant_config=quant_config,
             prefix=f"{prefix}.fc1",
+            disable_tp=use_data_parallel,
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
+            disable_tp=use_data_parallel,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -258,8 +270,8 @@ class Siglip2EncoderLayer(nn.Module):
         self,
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -267,15 +279,15 @@ class Siglip2EncoderLayer(nn.Module):
         self.self_attn = Siglip2Attention(
             config,
             quant_config=quant_config,
+            multimodal_config=multimodal_config,
             prefix=f"{prefix}.self_attn",
-            use_data_parallel=use_data_parallel,
         )
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = Siglip2MLP(
             config,
             quant_config=quant_config,
+            multimodal_config=multimodal_config,
             prefix=f"{prefix}.mlp",
-            use_data_parallel=use_data_parallel,
         )
 
     def forward(
@@ -288,7 +300,7 @@ class Siglip2EncoderLayer(nn.Module):
         Args:
             hidden_states: Input tensor of shape (batch, seq_len, embed_dim).
             cu_seqlens: Cumulative sequence lengths tensor.
-            position_embeddings: Position embeddings tensor.
+            max_seqlen: Maximum sequence length.
         """
         residual = hidden_states
 
@@ -320,8 +332,8 @@ class Siglip2Encoder(nn.Module):
         self,
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -330,8 +342,8 @@ class Siglip2Encoder(nn.Module):
                 Siglip2EncoderLayer(
                     config=config,
                     quant_config=quant_config,
+                    multimodal_config=multimodal_config,
                     prefix=f"{prefix}.layers.{idx}",
-                    use_data_parallel=use_data_parallel,
                 )
                 for idx in range(config.num_hidden_layers)
             ]
@@ -359,6 +371,7 @@ class Siglip2VisionTransformer(nn.Module):
         self,
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -372,8 +385,8 @@ class Siglip2VisionTransformer(nn.Module):
             self.encoder = Siglip2Encoder(
                 config,
                 quant_config=quant_config,
+                multimodal_config=multimodal_config,
                 prefix=f"{prefix}.encoder",
-                use_data_parallel=False,
             )
         num_hidden_layers = config.num_hidden_layers
         if len(self.encoder.layers) > config.num_hidden_layers:
@@ -426,6 +439,7 @@ class Siglip2Model(torch.nn.Module):
         self,
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -433,6 +447,7 @@ class Siglip2Model(torch.nn.Module):
         self.vision_model = Siglip2VisionTransformer(
             config,
             quant_config=quant_config,
+            multimodal_config=multimodal_config,
             prefix=f"{prefix}.vision_model",
         )
 

@@ -8,8 +8,8 @@
 import numpy as np
 import torch
 
-from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 
 @triton.jit()
@@ -540,8 +540,7 @@ def causal_conv1d_fn(
     args = None
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
-    target_dtype = conv_states.dtype if conv_states is not None else x.dtype
-    x = x.to(target_dtype)
+    x = x.to(conv_states.dtype)
     out = torch.empty_like(x)
     if metadata is not None:
         nums_dict = metadata.nums_dict

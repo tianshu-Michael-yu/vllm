@@ -3,13 +3,12 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, TypeAlias
 
 import numpy as np
 import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
-from vllm.utils.pinned_memory_pool import PinnedTensorPool
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -61,46 +60,21 @@ class LogprobsTensors(NamedTuple):
             cu_num_generated_tokens,
         )
 
-    def to_cpu_nonblocking(
-        self, pinned_memory_pool: "PinnedTensorPool | None" = None
-    ) -> "LogprobsTensors":
+    def to_cpu_nonblocking(self) -> "LogprobsTensors":
         if self.logprob_token_ids.device.type == "cpu":
             return self
-        if pinned_memory_pool is None:
-            return LogprobsTensors(
-                self.logprob_token_ids.to("cpu", non_blocking=True),
-                self.logprobs.to("cpu", non_blocking=True),
-                self.selected_token_ranks.to("cpu", non_blocking=True),
-            )
-
-        logprob_token_ids_cpu = pinned_memory_pool.acquire(
-            self.logprob_token_ids.shape,
-            dtype=self.logprob_token_ids.dtype,
-            pin_memory=True,
-        )
-        logprob_token_ids_cpu.copy_(self.logprob_token_ids, non_blocking=True)
-        pinned_memory_pool.record_event_if_managed(logprob_token_ids_cpu)
-
-        logprobs_cpu = pinned_memory_pool.acquire(
-            self.logprobs.shape,
-            dtype=self.logprobs.dtype,
-            pin_memory=True,
-        )
-        logprobs_cpu.copy_(self.logprobs, non_blocking=True)
-        pinned_memory_pool.record_event_if_managed(logprobs_cpu)
-
-        selected_token_ranks_cpu = pinned_memory_pool.acquire(
-            self.selected_token_ranks.shape,
-            dtype=self.selected_token_ranks.dtype,
-            pin_memory=True,
-        )
-        selected_token_ranks_cpu.copy_(self.selected_token_ranks, non_blocking=True)
-        pinned_memory_pool.record_event_if_managed(selected_token_ranks_cpu)
-
         return LogprobsTensors(
-            logprob_token_ids_cpu,
-            logprobs_cpu,
-            selected_token_ranks_cpu,
+            self.logprob_token_ids.to("cpu", non_blocking=True),
+            self.logprobs.to("cpu", non_blocking=True),
+            self.selected_token_ranks.to("cpu", non_blocking=True),
+        )
+
+    def filter(self, mask: torch.Tensor) -> "LogprobsTensors":
+        """Filter the logprobs tensors with the given bool mask."""
+        return LogprobsTensors(
+            self.logprob_token_ids[mask],
+            self.logprobs[mask],
+            self.selected_token_ranks[mask],
         )
 
     @staticmethod
@@ -125,7 +99,7 @@ class LogprobsTensors(NamedTuple):
 
 # [num_reqs, <dynamic>]
 # The shape of each element depends on the pooler used
-PoolerOutput = list[torch.Tensor | None] | torch.Tensor | None
+PoolerOutput: TypeAlias = torch.Tensor | list[torch.Tensor] | list[torch.Tensor | None]
 
 
 @dataclass
@@ -185,21 +159,23 @@ class ModelRunnerOutput:
     # num_generated_tokens is the number of tokens
     # generated in the current step. It can be different for
     # each request due to speculative/jump decoding.
-    sampled_token_ids: list[list[int]]
+    sampled_token_ids: list[list[int]] = field(default_factory=list)
 
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]
-    logprobs: LogprobsLists | None
+    logprobs: LogprobsLists | None = None
 
     # req_id -> (token_ids, logprobs, ranks)
     # [prompt_len, num_prompt_logprobs]
     # [prompt_len, num_prompt_logprobs]
     # [prompt_len]
-    prompt_logprobs_dict: dict[str, LogprobsTensors | None]
+    prompt_logprobs_dict: dict[str, LogprobsTensors | None] = field(
+        default_factory=dict
+    )
 
     # [num_reqs, hidden_size]
-    pooler_output: list[torch.Tensor | None]
+    pooler_output: list[torch.Tensor | None] | None = None
 
     kv_connector_output: KVConnectorOutput | None = None
 
@@ -259,21 +235,8 @@ def make_empty_encoder_model_runner_output(
         req_ids=req_ids,
         req_id_to_index=req_id_to_index,
         sampled_token_ids=sampled_token_ids,
-        logprobs=None,
-        prompt_logprobs_dict={},
         pooler_output=pooler_output,
-        kv_connector_output=None,
-        ec_connector_output=None,
-        num_nans_in_logits=None,
     )
 
 
-EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(
-    req_ids=[],
-    req_id_to_index={},
-    sampled_token_ids=[],
-    logprobs=None,
-    prompt_logprobs_dict={},
-    pooler_output=[],
-    num_nans_in_logits=None,
-)
+EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(req_ids=[], req_id_to_index={})

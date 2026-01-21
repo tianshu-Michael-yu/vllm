@@ -153,10 +153,9 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
             )
 
     def _device_tensor(self, data: list, dtype: torch.dtype) -> torch.Tensor:
-        cpu_tensor = torch.tensor(
+        return torch.tensor(
             data, device="cpu", dtype=dtype, pin_memory=self.pin_memory
-        )
-        return cpu_tensor.to(device=self.device, non_blocking=cpu_tensor.is_pinned())
+        ).to(device=self.device, non_blocking=True)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if self.biases:
@@ -227,10 +226,9 @@ class MinTokensLogitsProcessor(LogitsProcessor):
             )
 
     def _device_tensor(self, data: list, dtype: torch.dtype) -> torch.Tensor:
-        cpu_tensor = torch.tensor(
+        return torch.tensor(
             data, device="cpu", dtype=dtype, pin_memory=self.pin_memory
-        )
-        return cpu_tensor.to(device=self.device, non_blocking=cpu_tensor.is_pinned())
+        ).to(device=self.device, non_blocking=True)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if self.min_toks:
