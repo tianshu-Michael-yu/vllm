@@ -14,6 +14,8 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE,
     FusedMoeWeightScaleSupported,
+    is_combined_moe_weight,
+    load_combined_moe_weight,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEActivationFormat,
@@ -65,6 +67,9 @@ __all__ = [
     "activation_without_mul",
     "override_config",
     "get_config",
+    # Combined MoE weight loading support
+    "is_combined_moe_weight",
+    "load_combined_moe_weight",
 ]
 
 if HAS_TRITON:

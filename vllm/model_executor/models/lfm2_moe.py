@@ -15,7 +15,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoE, load_combined_moe_weight
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -513,6 +513,10 @@ class Lfm2MoeModel(nn.Module):
 
             if ".conv." in name:
                 name = name.replace(".conv.", ".short_conv.", 1)
+
+            if load_combined_moe_weight(self, name, loaded_weight):
+                loaded_params.add(name)
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).

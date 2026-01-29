@@ -1034,6 +1034,130 @@ class FusedMoE(CustomOp):
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
 
+    def load_combined_gate_up_proj(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> bool:
+        """
+        Load combined gate_up_proj weights from transformers format.
+
+        This handles the combined 3D tensor format used by transformers MoE models:
+        - Input shape: [num_experts, 2*intermediate_size, hidden_size]
+        - Target: FusedMoE's w13_weight parameter
+
+        Handles tensor parallelism by sharding on the intermediate_size dimension.
+
+        Args:
+            param: The w13_weight parameter to load into
+            loaded_weight: Combined gate_up tensor [num_experts, 2*inter, hidden]
+
+        Returns:
+            True if successfully loaded
+        """
+        # Validate shape - should be 3D [num_experts, 2*intermediate, hidden]
+        if loaded_weight.dim() != 3:
+            logger.warning(
+                f"load_combined_gate_up_proj: expected 3D tensor, got {loaded_weight.dim()}D"
+            )
+            return False
+
+        num_experts = loaded_weight.shape[0]
+        combined_inter_size = loaded_weight.shape[1]
+        hidden_size = loaded_weight.shape[2]
+
+        # Shard on dimension 1 (intermediate_size * 2) for tensor parallelism
+        # gate_up_proj is MergedColumnParallel, so we shard on output dim
+        shard_size = combined_inter_size // self.tp_size
+        start = self.tp_rank * shard_size
+        end = start + shard_size
+
+        # Extract this TP rank's shard
+        sharded_weight = loaded_weight[:, start:end, :].contiguous()
+
+        # Move to correct device and dtype
+        sharded_weight = sharded_weight.to(
+            device=param.data.device,
+            dtype=param.data.dtype,
+        )
+
+        # Copy to parameter
+        if param.data.shape == sharded_weight.shape:
+            param.data.copy_(sharded_weight)
+            logger.debug(
+                f"load_combined_gate_up_proj: loaded {num_experts} experts, "
+                f"tp_rank={self.tp_rank}, shard=[{start}:{end}], shape={sharded_weight.shape}"
+            )
+            return True
+        else:
+            logger.warning(
+                f"load_combined_gate_up_proj: shape mismatch - "
+                f"param={param.data.shape}, sharded={sharded_weight.shape}"
+            )
+            return False
+
+    def load_combined_down_proj(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> bool:
+        """
+        Load combined down_proj weights from transformers format.
+
+        This handles the combined 3D tensor format used by transformers MoE models:
+        - Input shape: [num_experts, hidden_size, intermediate_size]
+        - Target: FusedMoE's w2_weight parameter
+
+        Handles tensor parallelism by sharding on the intermediate_size dimension.
+
+        Args:
+            param: The w2_weight parameter to load into
+            loaded_weight: Combined down tensor [num_experts, hidden, inter]
+
+        Returns:
+            True if successfully loaded
+        """
+        # Validate shape - should be 3D [num_experts, hidden, intermediate]
+        if loaded_weight.dim() != 3:
+            logger.warning(
+                f"load_combined_down_proj: expected 3D tensor, got {loaded_weight.dim()}D"
+            )
+            return False
+
+        num_experts = loaded_weight.shape[0]
+        hidden_size = loaded_weight.shape[1]
+        inter_size = loaded_weight.shape[2]
+
+        # Shard on dimension 2 (intermediate_size) for tensor parallelism
+        # down_proj is RowParallel, so we shard on input dim
+        shard_size = inter_size // self.tp_size
+        start = self.tp_rank * shard_size
+        end = start + shard_size
+
+        # Extract this TP rank's shard
+        sharded_weight = loaded_weight[:, :, start:end].contiguous()
+
+        # Move to correct device and dtype
+        sharded_weight = sharded_weight.to(
+            device=param.data.device,
+            dtype=param.data.dtype,
+        )
+
+        # Copy to parameter
+        if param.data.shape == sharded_weight.shape:
+            param.data.copy_(sharded_weight)
+            logger.debug(
+                f"load_combined_down_proj: loaded {num_experts} experts, "
+                f"tp_rank={self.tp_rank}, shard=[{start}:{end}], shape={sharded_weight.shape}"
+            )
+            return True
+        else:
+            logger.warning(
+                f"load_combined_down_proj: shape mismatch - "
+                f"param={param.data.shape}, sharded={sharded_weight.shape}"
+            )
+            return False
+
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
     ):
@@ -1986,6 +2110,100 @@ class FusedMoE(CustomOp):
         )
 
         return s
+
+
+def is_combined_moe_weight(name: str) -> tuple[bool, str | None]:
+    """
+    Check if a weight name indicates a combined MoE weight format.
+
+    Combined format is used by transformers during training:
+    - experts.gate_up_proj: [num_experts, 2*intermediate, hidden]
+    - experts.down_proj: [num_experts, hidden, intermediate]
+
+    Args:
+        name: Weight name to check
+
+    Returns:
+        (is_combined, weight_type) where weight_type is "gate_up" or "down" or None
+    """
+    if ".experts.gate_up_proj" in name:
+        return True, "gate_up"
+    elif ".experts.down_proj" in name:
+        return True, "down"
+    return False, None
+
+
+def load_combined_moe_weight(
+    model: torch.nn.Module,
+    name: str,
+    weight: torch.Tensor,
+) -> bool:
+    """
+    Load a combined MoE weight into the appropriate FusedMoE layer.
+
+    This function detects combined weight format (gate_up_proj, down_proj)
+    and loads them into vLLM's FusedMoE layers with proper TP sharding.
+
+    Args:
+        model: The vLLM model containing FusedMoE layers
+        name: Weight name (e.g., "model.layers.0.mlp.experts.gate_up_proj")
+        weight: Combined weight tensor
+
+    Returns:
+        True if the weight was loaded, False if it wasn't a combined MoE weight
+    """
+    is_combined, weight_type = is_combined_moe_weight(name)
+    if not is_combined:
+        return False
+
+    # Find the FusedMoE layer that this weight belongs to
+    # Parse the layer path from the weight name
+    # e.g., "model.layers.0.mlp.experts.gate_up_proj" -> "model.layers.0.mlp.experts"
+    # e.g., "model.layers.0.feed_forward.experts.gate_up_proj" -> "model.layers.0.feed_forward.experts"
+    if weight_type == "gate_up":
+        layer_path = name.replace(".gate_up_proj", "")
+    else:  # down
+        layer_path = name.replace(".down_proj", "")
+
+    # Navigate to the FusedMoE layer
+    parts = layer_path.split(".")
+    current = model
+    for part in parts:
+        if part.isdigit():
+            current = current[int(part)]
+        elif hasattr(current, part):
+            current = getattr(current, part)
+        else:
+            logger.warning(f"load_combined_moe_weight: cannot find {part} in {current}")
+            return False
+
+    if not isinstance(current, FusedMoE):
+        logger.warning(f"load_combined_moe_weight: {layer_path} is not a FusedMoE layer")
+        return False
+
+    # Load the combined weight
+    if weight_type == "gate_up":
+        # Find w13_weight parameter
+        w13_param = None
+        for pname, param in current.named_parameters():
+            if "w13_weight" in pname:
+                w13_param = param
+                break
+        if w13_param is None:
+            logger.warning(f"load_combined_moe_weight: cannot find w13_weight in {layer_path}")
+            return False
+        return current.load_combined_gate_up_proj(w13_param, weight)
+    else:  # down
+        # Find w2_weight parameter
+        w2_param = None
+        for pname, param in current.named_parameters():
+            if "w2_weight" in pname:
+                w2_param = param
+                break
+        if w2_param is None:
+            logger.warning(f"load_combined_moe_weight: cannot find w2_weight in {layer_path}")
+            return False
+        return current.load_combined_down_proj(w2_param, weight)
 
 
 def get_layer_from_name(layer_name: str) -> FusedMoE:
