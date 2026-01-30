@@ -1066,14 +1066,30 @@ class FusedMoE(CustomOp):
         combined_inter_size = loaded_weight.shape[1]
         hidden_size = loaded_weight.shape[2]
 
-        # Shard on dimension 1 (intermediate_size * 2) for tensor parallelism
-        # gate_up_proj is MergedColumnParallel, so we shard on output dim
-        shard_size = combined_inter_size // self.tp_size
+        # gate_up_proj is MergedColumnParallel, so we shard on output dim.
+        # NOTE: gate_up_proj is a concatenation of gate and up projections.
+        # We must shard gate and up separately, then re-concatenate, otherwise
+        # TP>1 would give one rank only gate and the other only up.
+        if combined_inter_size % 2 != 0:
+            logger.warning(
+                "load_combined_gate_up_proj: expected even combined_inter_size, "
+                f"got {combined_inter_size}"
+            )
+            return False
+
+        per_proj_inter_size = combined_inter_size // 2
+        shard_size = per_proj_inter_size // self.tp_size
         start = self.tp_rank * shard_size
         end = start + shard_size
 
-        # Extract this TP rank's shard
-        sharded_weight = loaded_weight[:, start:end, :].contiguous()
+        gate_weight = loaded_weight[:, :per_proj_inter_size, :]
+        up_weight = loaded_weight[:, per_proj_inter_size:, :]
+
+        gate_shard = gate_weight[:, start:end, :]
+        up_shard = up_weight[:, start:end, :]
+
+        # Extract this TP rank's shard (gate then up)
+        sharded_weight = torch.cat((gate_shard, up_shard), dim=1).contiguous()
 
         # Move to correct device and dtype
         sharded_weight = sharded_weight.to(
