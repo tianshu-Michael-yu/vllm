@@ -11,6 +11,17 @@ except Exception as e:
     __version__ = "dev"
     __version_tuple__ = (0, 0, __version__)
 
+# Prefer the installed distribution version when available, since setup.py may
+# append extra build metadata (for example precompiled wheel commit/variant).
+try:
+    from importlib.metadata import version as _dist_version
+
+    _installed_version = _dist_version("vllm")
+    if _installed_version:
+        __version__ = _installed_version
+except Exception:
+    pass
+
 
 def _prev_minor_version_was(version_str):
     """Check whether a given version matches the previous minor version.

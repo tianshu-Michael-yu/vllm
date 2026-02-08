@@ -842,6 +842,15 @@ def get_vllm_version() -> str:
     elif _is_cuda():
         if envs.VLLM_USE_PRECOMPILED and not envs.VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX:
             version += f"{sep}precompiled"
+            # Surface which precompiled kernel bundle we are targeting.
+            precompiled_commit = os.getenv("VLLM_PRECOMPILED_WHEEL_COMMIT", "").strip().lower()
+            if re.fullmatch(r"[0-9a-f]{40}", precompiled_commit):
+                version += f".pc{precompiled_commit[:10]}"
+            precompiled_variant = os.getenv("VLLM_PRECOMPILED_WHEEL_VARIANT", "").strip().lower()
+            if precompiled_variant:
+                normalized_variant = re.sub(r"[^0-9a-z]+", "", precompiled_variant)
+                if normalized_variant:
+                    version += f".{normalized_variant}"
         else:
             cuda_version = str(get_nvcc_cuda_version())
             if cuda_version != envs.VLLM_MAIN_CUDA_VERSION:
