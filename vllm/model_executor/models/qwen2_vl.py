@@ -835,6 +835,24 @@ class Qwen2VLProcessingInfo(BaseProcessingInfo):
     def get_image_processor(self, **kwargs: object) -> Qwen2VLImageProcessor:
         return self.get_hf_processor(**kwargs).image_processor
 
+    
+    def _get_resize_pixel_bounds(
+        image_processor: Qwen2VLImageProcessor,
+    ) -> tuple[int, int]:
+        size = getattr(image_processor, "size", None)
+        if hasattr(size, "get"):
+            min_pixels = size.get("shortest_edge")
+            max_pixels = size.get("longest_edge")
+        else:
+            min_pixels = getattr(size, "shortest_edge", None)
+            max_pixels = getattr(size, "longest_edge", None)
+        if min_pixels is None or max_pixels is None:
+            raise ValueError(
+                "Qwen2-VL processing requires image_processor.size with "
+                "'shortest_edge' and 'longest_edge' for transformers==5.1.0."
+            )
+        return int(min_pixels), int(max_pixels)
+
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"image": None, "video": None}
 
@@ -866,12 +884,15 @@ class Qwen2VLProcessingInfo(BaseProcessingInfo):
         temporal_patch_size = vision_config.temporal_patch_size
 
         if do_resize:
+            min_pixels, max_pixels = self._get_resize_pixel_bounds(
+                image_processor,
+            )
             resized_height, resized_width = smart_resize(
                 height=image_height,
                 width=image_width,
                 factor=patch_size * merge_size,
-                min_pixels=image_processor.min_pixels,
-                max_pixels=image_processor.max_pixels,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
             )
             preprocessed_size = ImageSize(width=resized_width, height=resized_height)
         else:
@@ -940,7 +961,7 @@ class Qwen2VLProcessingInfo(BaseProcessingInfo):
         patch_size = vision_config.patch_size
         merge_size = vision_config.spatial_merge_size
         image_processor = self.get_image_processor()
-        max_pixels = image_processor.max_pixels or image_processor.size["longest_edge"]
+        _, max_pixels = self._get_resize_pixel_bounds(image_processor)
         unit = patch_size * merge_size
         max_seq_len = max_pixels // (unit * unit)
 

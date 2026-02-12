@@ -3,6 +3,7 @@
 
 import pytest
 
+from vllm.model_executor.models.qwen2_vl import Qwen2VLProcessingInfo
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from ....conftest import ImageTestAssets
@@ -88,3 +89,27 @@ def test_get_image_size_with_most_features(
         t, h, w = grid_thw[0]
         tokens = (t * h * w) // (merge_size**2)
         assert tokens < max_tokens
+
+
+def test_resize_pixel_bounds_from_size() -> None:
+    image_processor = type(
+        "ImageProcessor",
+        (),
+        {"size": {"shortest_edge": 3136, "longest_edge": 12845056}},
+    )()
+
+    min_pixels, max_pixels = Qwen2VLProcessingInfo._get_resize_pixel_bounds(image_processor)
+
+    assert min_pixels == 3136
+    assert max_pixels == 12845056
+
+
+def test_resize_pixel_bounds_missing_size_keys() -> None:
+    image_processor = type(
+        "ImageProcessor",
+        (),
+        {"size": {"shortest_edge": 3136}},
+    )()
+
+    with pytest.raises(ValueError, match="transformers==5.1.0"):
+        Qwen2VLProcessingInfo._get_resize_pixel_bounds(image_processor)
