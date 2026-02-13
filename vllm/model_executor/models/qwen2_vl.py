@@ -836,6 +836,7 @@ class Qwen2VLProcessingInfo(BaseProcessingInfo):
         return self.get_hf_processor(**kwargs).image_processor
 
     
+    @staticmethod
     def _get_resize_pixel_bounds(
         image_processor: Qwen2VLImageProcessor,
     ) -> tuple[int, int]:

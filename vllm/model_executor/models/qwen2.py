@@ -74,6 +74,14 @@ from .utils import (
 )
 
 
+def _resolve_tie_word_embeddings(text_config: Any, hf_config: Any) -> bool:
+    """Resolve tied-embedding flag across HF config layout variants."""
+    tie_word_embeddings = getattr(text_config, "tie_word_embeddings", None)
+    if tie_word_embeddings is None:
+        tie_word_embeddings = getattr(hf_config, "tie_word_embeddings", False)
+    return bool(tie_word_embeddings)
+
+
 class Qwen2MLP(nn.Module):
     def __init__(
         self,
@@ -359,9 +367,11 @@ class Qwen2Model(nn.Module):
     ):
         super().__init__()
 
-        config = vllm_config.model_config.hf_config.get_text_config()
+        hf_config = vllm_config.model_config.hf_config
+        config = hf_config.get_text_config()
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        tie_word_embeddings = _resolve_tie_word_embeddings(config, hf_config)
 
         # TODO (@robertgshaw2): see if this can be moved out
         if is_interleaved(vllm_config.model_config.hf_text_config):
@@ -380,7 +390,7 @@ class Qwen2Model(nn.Module):
         self.vocab_size = config.vocab_size
 
         if get_pp_group().is_first_rank or (
-            config.tie_word_embeddings and get_pp_group().is_last_rank
+            tie_word_embeddings and get_pp_group().is_last_rank
         ):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -534,10 +544,12 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        config = vllm_config.model_config.hf_config.get_text_config()
+        hf_config = vllm_config.model_config.hf_config
+        config = hf_config.get_text_config()
         quant_config = vllm_config.quant_config
 
         self.config = config
+        self.tie_word_embeddings = _resolve_tie_word_embeddings(config, hf_config)
 
         self.quant_config = quant_config
         self.model = Qwen2Model(
@@ -545,7 +557,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         )
 
         if get_pp_group().is_last_rank:
-            if config.tie_word_embeddings:
+            if self.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(
@@ -595,6 +607,6 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+            skip_prefixes=(["lm_head."] if self.tie_word_embeddings else None),
         )
         return loader.load_weights(weights)
